@@ -1,0 +1,29 @@
+{
+  "comment": "口令块字数夹具（规格 §8.1：夸克三行 51 / 无提取码两行 41 / 百度四项 102）。逐字渲染，测试直接比对字数。",
+  "cases": [
+    {
+      "name": "quark_three_lines",
+      "disk": "quark",
+      "book_title": "运动改造大脑",
+      "url": "https://pan.quark.cn/s/60fc0b3c0f8d",
+      "passcode": "22EM",
+      "expected_len": 51
+    },
+    {
+      "name": "quark_two_lines_no_passcode",
+      "disk": "quark",
+      "book_title": "小岛经济学",
+      "url": "https://pan.quark.cn/s/60fc0b3c0f8d",
+      "passcode": null,
+      "expected_len": 41
+    },
+    {
+      "name": "baidu_four_items",
+      "disk": "baidu",
+      "book_title": "杀死一只知更鸟",
+      "url": "https://pan.baidu.com/s/1TKxndMvHX7PRrO05zFR7yw",
+      "passcode": "ktiy",
+      "expected_len": 102
+    }
+  ]
+}
