@@ -189,3 +189,16 @@ docs/ / marketplace/      部署、隐私、发布记录及市场条目
 代码使用 MIT，保留 [c1overzz/dsh-bili-scroll](https://github.com/c1overzz/dsh-bili-scroll) 和 [AGI_Ananas / bilibili-mcp](https://github.com/adoresever/bilibili-mcp) 的许可证与署名。见 [LICENSE](LICENSE)、[NOTICE.md](NOTICE.md) 与 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
 
 图片、参考音频和模型文件的授权与代码许可分别处理，见 [素材说明](docs/ASSETS.md)。项目不附带 B站或模型服务账号；发布内容和素材应满足对应平台规则及授权范围。
+
+---
+
+## 鲸鱼书评线 fork 说明（xiaofeng930415 fork，2026-11-06）
+
+本 fork 用于 `xiaofeng930415/xianyu-publisher` 的「鲸鱼娘 × B站书源门自动书评」（规格见该仓 `docs/spec-whale-bili-book-comment.md`）。
+
+- **基线**：上游 `v2.6.0`；工作分支 `whale-book-comment`；fork tag `whale-v2.6.0-1`（每个上游版本打一次）。
+- **改造**（按主题拆 commit，可单独回贡）：`bili_book_comment` 工具 + 书评模式官腔闸 warn + `book:`/`up:` 判重键 + 后台白名单收窄 + `prompts/book-review.md` + `vendor/book-gate/`（仓库逐字副本）。
+- **安装**：`cd ~/.dsh/profiles/desktop && pnpm add "link:$HOME/gitstore/dsh-deepmoyu"`，然后**完全退出 App 重开**。
+- **升级**：`git fetch upstream --tags` → `git merge v2.X.Y` → `npm ci && npm test && node selfcheck.mjs` → 完全重启 → 打新 fork tag。
+- **回滚**：`git checkout whale-v2.6.0-1` + 完全重启；彻底回滚＝`pnpm add dsh-deepmoyu@2.6.0`。
+- **不改**上游 `prompts/duty.md`；改 `.py` 必须改本仓源码（`ensureHomeFiles` 会覆盖运行目录副本）。
