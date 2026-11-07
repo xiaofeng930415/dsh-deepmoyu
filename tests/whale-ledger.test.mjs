@@ -2,8 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   emptyLedger, whaleLedgerFile, parseBlockContact,
-  withGateHit, withBeforeSend, withAfterSend, withEvent,
-  missingGuardSends, capLedger, WHALE_LEDGER_MAX,
+  withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill,
+  missingGuardSends, capLedger, localDayOf, WHALE_LEDGER_MAX,
 } from '../lib/whale-ledger.mjs'
 
 const NL = String.fromCharCode(10)
@@ -17,6 +17,29 @@ test('parseBlockContact extracts url/code/disk from the block text', () => {
   assert.equal(parseBlockContact(BAIDU_BLOCK).disk, 'baidu')
   assert.equal(parseBlockContact(BAIDU_BLOCK).code, 'ktiy')
   assert.deepEqual(parseBlockContact(''), { url: '', code: '', disk: '' })
+  // 盘别跟「找到的那个 URL」走：块同时含两域名时不与 link 打架
+  const bothDomains = ['资源包', 'https://pan.quark.cn/s/quark-one', '备用：https://pan.baidu.com/s/baidu-one'].join(NL)
+  const both = parseBlockContact(bothDomains)
+  assert.equal(both.disk, 'quark')
+  assert.equal(both.url, 'https://pan.quark.cn/s/quark-one')
+})
+
+test('withBackfill appends reconciled rows idempotently and requires id+bvid', () => {
+  let ledger = emptyLedger()
+  const entry = { id: 'wl-guard-abc', bvid: 'BV1234567890', rpid: '999', text: '含链接的正文 https://pan.quark.cn/s/x', posted_at: '2026-11-07T10:00:00+08:00', posted_ts: 1 }
+  ledger = withBackfill(ledger, entry)
+  ledger = withBackfill(ledger, entry)
+  assert.equal(ledger.posted.length, 1, '同 id 幂等')
+  assert.equal(ledger.posted[0].backfill, true)
+  assert.equal(ledger.posted[0].rpid, '999')
+  ledger = withBackfill(ledger, { ...entry, bvid: '' })
+  assert.equal(ledger.posted.length, 1, '缺 bvid 拒绝（guard 行身份不齐）')
+})
+
+test('localDayOf normalizes to the state.mjs dayKey format', () => {
+  assert.equal(localDayOf('2026-11-07T10:00:00+08:00'), '2026-11-07')
+  assert.equal(localDayOf(new Date(2026, 0, 5)), '2026-01-05', 'dayKey 补零口径')
+  assert.equal(localDayOf('not-a-date'), '')
 })
 
 test('three write points accumulate one lifecycle record; same-id gate hit is idempotent', () => {
@@ -81,6 +104,11 @@ test('missingGuardSends diffs guard send rows against ledger by rpid then bvid+d
   ]
   const missing = missingGuardSends(guardRows, ledger)
   assert.deepEqual(missing.map(r => r.rpid || r.bvid), ['222', 'BV1234567892'], '已记账的 111 不缺；unknown 状态不参与对账')
+  // 同 bvid 同本地日、不同 rpid ⇒ 视为已记账（书评线同视频每日 ≤1）；跨天 ⇒ 缺记
+  const sameDayOtherRpid = { key: 'send:comment:5', kind: 'send', status: 'sent', bvid: 'BV1234567890', rpid: '888', at: new Date('2026-11-07T11:59:00+08:00').toISOString() }
+  const nextDayOtherRpid = { key: 'send:comment:6', kind: 'send', status: 'sent', bvid: 'BV1234567890', rpid: '777', at: new Date('2026-11-08T10:00:00+08:00').toISOString() }
+  assert.equal(missingGuardSends([sameDayOtherRpid], ledger).length, 0, '同 bvid 同日视为已记账')
+  assert.equal(missingGuardSends([nextDayOtherRpid], ledger).length, 1, '同 bvid 跨天判缺记')
 })
 
 test('capLedger bounds posted and events, evicting the oldest first', () => {

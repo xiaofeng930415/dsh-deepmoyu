@@ -89,7 +89,7 @@ import {
 // ✍️ 评论质量的**硬下限**（只判"有没有内容"，不判好不好）—— 2026-10-20 使用者要求「不能单纯为了哗众取宠」
 import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK, bookHookOf } from './lib/comment.mjs'
 import { callBookGate } from './lib/book-gate.mjs'
-import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, missingGuardSends, writeWhaleLedgerFile } from './lib/whale-ledger.mjs'
+import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile } from './lib/whale-ledger.mjs'
 // 🧠 口味本子：把自己发出去的评论和被赞数对上，算出哪种说话方式有人爱听 —— 2026-10-20 使用者要的
 import { tasteRemember, tasteApplyLikes, tasteStats, tasteDigest, tasteTop, tasteMirror, TASTE_MIN_N } from './lib/taste.mjs'
 // 🎓 自主学习：学到的先进待审队列，批准了才注入提示词 —— 2026-10-21 使用者第 2 条要求
@@ -2879,24 +2879,37 @@ export function apply(ctx, config) {
    *  批运行 cwd=插件家；仓内镜像与上报由 push 侧从 DUTY 家读取，偏差记入 #1661）。
    *  原子写（writeJson）+ withStateLock 串行，跟 state.json 一把锁。 */
   const whaleLedgerPath = () => whaleLedgerFile(stateDir)
-  const whaleLedgerWrite = (mutate) => withStateLock(() => {
-    const ledger = mutate(readJson(whaleLedgerPath(), emptyLedger()))
-    writeWhaleLedgerFile(stateDir, ledger)
-    return ledger
-  })
+  const whaleLedgerWrite = async (mutate) => {
+    try {
+      return await withStateLock(() => {
+        const ledger = mutate(readJson(whaleLedgerPath(), emptyLedger()))
+        writeWhaleLedgerFile(stateDir, ledger)
+        return ledger
+      })
+    } catch (e) {
+      // 📇 ledger 是业务记录，不是发送链的闸：损坏/写失败**不能**把一次已成功的发送变成报错，
+      //    也不能拦住组合（缺的行由批起止的 guard 对账自愈补写）。fail-open + 留痕。
+      log('whale ledger 读写失败（不致命，对账会补）：' + String(e?.message ?? e))
+      return null
+    }
+  }
   const whaleLedgerEvent = async (code, detail, extra = {}) => {
     try { await whaleLedgerWrite((l) => withEvent(l, { code, detail, ...extra })) } catch (e) { log('whale ledger 事件写入失败（不致命）：' + String(e?.message ?? e)) }
   }
 
   const composeBookComment = async (args, exec) => {
-    const bvidRef = { v: '' }, titleRef = { v: '' }
+    /* ⓪① 公共量先取（纯字符串操作，无 IO）⇒ blocked 的事件上下文直接读闭包。 */
+    const bvid = String(args.bvid ?? '').trim()
+    const title = String(args.title ?? '').trim()
+    const hook = String(args.hook ?? '').trim()
+    const hookLen = Array.from(hook).length
     const blocked = (extra) => {
       const code = String(extra.code || '')
       // 📇 事件码进 ledger（规格 §10.1 events[]，可追加）：hook-over 映射为规格名 hook-over-budget；
       //    posture 拦截（无 code 的开关闭合）不记，避免开关未开时刷事件。
       if (code) {
         const map = { 'hook-over': 'hook-over-budget' }
-        whaleLedgerEvent(map[code] || code, String(extra.hint ?? ''), { bvid: bvidRef.v, bookId: titleRef.v })
+        whaleLedgerEvent(map[code] || code, String(extra.hint ?? ''), { bvid, bookId: title })
       }
       return { ok: false, blocked: true, tool: 'bili_book_comment', ...extra }
     }
@@ -2906,12 +2919,6 @@ export function apply(ctx, config) {
       return blocked({ hint: '工作台 → 互动与投递中的「自动评论视频」未开启 —— 书评与普通评论共用这个开关；未开启时不跑书源门、不发送。' })
     }
     /* ① 本地预检（§5.2 入参契约）：bvid / 书名 / hook ≤90 字，超了直接回，不跑 gate。 */
-    const bvid = String(args.bvid ?? '').trim()
-    const title = String(args.title ?? '').trim()
-    const hook = String(args.hook ?? '').trim()
-    const hookLen = Array.from(hook).length
-    bvidRef.v = bvid
-    titleRef.v = title
     if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) {
       return blocked({ code: 'hook-invalid', hook_used: hookLen, hint: 'bvid 必须是 BV + 10 位字母数字（拿到「' + bvid.slice(0, 40) + '」）。' })
     }
@@ -2957,6 +2964,11 @@ export function apply(ctx, config) {
     if (bookHit.hit && dupHitToday(bookHit.at)) {
       return blocked({ code: 'dup-book', hint: '这本书（' + bookId + '）今天已经发过一条' + (bookHit.at ? '（' + bookHit.at + '）' : '') + ' —— 同书每日 ≤1，换一本活跃书。' })
     }
+    /* ③.5 📇 WP1 书源门命中（规格 §10.1 写入点①）：命中即落行 —— book_id / book_title /
+     *    link(从块解析) / code / disk / from_ledger / job_id / candidate_id；
+     *    后续 hook-over 等只补事件（§8.4 记 skipped 原因），发送字段由 WP2/WP3 真正发送时补全。 */
+    const wlId = 'wl-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+    await whaleLedgerWrite((l) => withGateHit(l, { id: wlId, bvid, bookId, bookTitle: title, block, fromLedger: gate.fromLedger === true, jobId: gate.jobId ?? null, candidateId: gate.candidateId ?? null, ledgerLookup: String(gate.source ?? '') }))
     /* ④ 注入：text = hook + 换行 + block，硬上限 150（§5.2 步骤 4：超预算回精确剩余字数，允许重写 1 次；
      *    不截断、不降级成裸口令块）。 */
     const text = hook + '\n' + block
@@ -2964,11 +2976,7 @@ export function apply(ctx, config) {
     if (textLen > 150) {
       return blocked({ code: 'hook-over', hook_used: hookLen, hook_left: 90, block_len: blockLen, hint: '全文 ' + textLen + ' 字，超 150 上限 ' + (textLen - 150) + ' 字 —— 把 hook 删到 ' + Math.max(0, hookLen - (textLen - 150)) + ' 字以内再调一次（同轮最多重写 1 次，不截断、不降级）。' })
     }
-    /* ⑤ 写进**同一个 args 对象**（审批路径靠对象身份免重跑，§5.3），元数据留给执行层记账。
-     *  📇 WP1 书源门命中（规格 §10.1）：book_id/book_title/link/code/disk/from_ledger/job_id/
-     *     candidate_id —— link 与 code 从口令块文本解析（块就是要发出去的链接，宿主拼接过）。 */
-    const wlId = 'wl-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-    await whaleLedgerWrite((l) => withGateHit(l, { id: wlId, bvid, bookId, bookTitle: title, block, fromLedger: gate.fromLedger === true, jobId: gate.jobId ?? null, candidateId: gate.candidateId ?? null, ledgerLookup: String(gate.source ?? '') }))
+    /* ⑤ 写进**同一个 args 对象**（审批路径靠对象身份免重跑，§5.3），元数据留给执行层记账。 */
     args.text = text
     args.bookId = bookId
     args.gateSource = String(gate.source ?? '')
@@ -3033,8 +3041,16 @@ export function apply(ctx, config) {
       const wlGuard = String(out?.guard_status || (wlSent ? 'sent' : out?.blocked ? (out?.pace ? 'pace-blocked' : 'blocked') : 'unknown'))
       await whaleLedgerWrite((l) => withAfterSend(l, info.wlId, { rpid: wlRpid, guardStatus: wlGuard, sent: wlSent, errorCode: out?.code ?? null, postedAt: wlSent ? new Date().toISOString() : '' }))
       if (!wlSent) {
+        // 事件码口径（§8.4/§9.5）：pace 拦截**不算失败**（自有 pace-blocked 码）；质量/模板拦的是钩子
+        // （hook-invalid）；12006/12014 用规格的 send-rejected:<码>；其余拒绝码用 send-rejected（码进
+        // detail）；只有「发没发成未知」才记 send-unknown（§9.5 L1 触发码，不能被节奏拦截稀释）。
         const wlCode = out?.code != null ? String(out.code) : ''
-        await whaleLedgerEvent(wlCode ? 'send-rejected:' + wlCode : 'send-unknown', String(out?.error || out?.hint || ''), { bvid: String(args.bvid ?? ''), bookId: info.bookId })
+        let wlEvent = 'send-unknown'
+        if (wlGuard === 'pace-blocked' || out?.pace) wlEvent = 'pace-blocked'
+        else if (out?.blocked && (out?.shallow || out?.template)) wlEvent = 'hook-invalid'
+        else if (wlCode === '12006' || wlCode === '12014') wlEvent = 'send-rejected:' + wlCode
+        else if (wlCode) wlEvent = 'send-rejected'
+        await whaleLedgerEvent(wlEvent, (wlCode ? 'code=' + wlCode + ' ' : '') + String(out?.error || out?.hint || ''), { bvid: String(args.bvid ?? ''), bookId: info.bookId })
       }
       /* 📇 发送成功才记账 book:/up:（§8.3 只发成功后写，不预占）；nu:/taste/seen 由发送链自己写。 */
       if (sendOk(out)) {
@@ -3617,15 +3633,30 @@ export function apply(ctx, config) {
   const reconcileWhaleLedger = async (trigger) => {
     try {
       if (!existsSync(join(stateDir, 'runtime-guard.sqlite3'))) return
-      const r = spawnSync('python3', [join(stateDir, 'runtime_guard.py'), '--home', stateDir, '--limit', '200'], { encoding: 'utf8', timeout: 25000 })
-      const snap = JSON.parse(r.stdout || 'null')
-      const rows = Array.isArray(snap?.recentSends) ? snap.recentSends.filter((x) => x?.status === 'sent') : []
+      // 解释器复用 venvPython()（规格外链库只在 venv；这里其实只用 stdlib，但对齐口径）
+      const pyBin = existsSync(venvPython()) ? venvPython() : (cfg.pythonPath && cfg.pythonPath !== 'python' ? cfg.pythonPath : 'python3')
+      const today = localDayOf(new Date().toISOString())
+      // ⚠️ 异步 spawn：批止回调跑在事件循环上，spawnSync 最多会卡宿主 25s
+      const snap = await new Promise((resolve) => {
+        let out = ''
+        let settled = false
+        const child = spawn(pyBin, [join(stateDir, 'runtime_guard.py'), '--home', stateDir, '--limit', '200'], { stdio: ['ignore', 'pipe', 'pipe'] })
+        const done = (value) => { if (settled) return; settled = true; clearTimeout(timer); try { child.kill('SIGKILL') } catch { /* 已经没了 */ } resolve(value) }
+        const timer = setTimeout(() => done(null), 25000)
+        child.stdout?.on?.('data', (chunk) => { out += chunk })
+        child.once?.('close', () => { let parsed = null; try { parsed = JSON.parse(out || 'null') } catch { /* 尾部截断当无快照 */ } done(parsed) })
+        child.once?.('error', () => done(null))
+      })
+      // 规格 §10.1：「取**当天** kind='send'」——跨天旧缺口不在自动对账里灌（补写上限见下）
+      const sends = Array.isArray(snap?.recentSends) ? snap.recentSends.filter((x) => x?.status === 'sent' && localDayOf(x?.at) === today) : []
       let missing = []
-      await whaleLedgerWrite((l) => { missing = missingGuardSends(rows, l); return l })
+      await whaleLedgerWrite((l) => { missing = missingGuardSends(sends, l); return l })
       if (!missing.length) return
+      // 每批最多补 20 条：防「停机多天后一次性灌入」；补不完的下一批对账继续，回落代价写在这里
       for (const row of missing.slice(0, 20)) {
         const st = readJson(dutyStateFile, {})
         const tasteText = String(st?.taste?.[String(row.rpid ?? '')]?.text ?? '')
+        // 只补带网盘链接正文的行：普通评论同样走 guard 占坑，但不属于书评线账本（防灌账）
         if (!/pan\.quark\.cn|pan\.baidu\.com/.test(tasteText)) continue
         let aid = ''
         let mid = ''
@@ -3635,12 +3666,19 @@ export function apply(ctx, config) {
           mid = readableId(info?.owner?.mid ?? '') || String(info?.owner?.mid ?? '')
         } catch { /* 补不上就不补这两个字段 */ }
         const at = String(row.at || new Date().toISOString())
-        await whaleLedgerWrite((l) => {
-          const id = 'wl-guard-' + createHash('sha1').update(String(row.key || row.at || Math.random())).digest('hex').slice(0, 12)
-          if (l.posted.some((x) => x.id === id)) return l
-          const entry = { id, bvid: String(row.bvid ?? ''), rpid: String(row.rpid || ''), text: tasteText, aid, mid, backfill: true, source: 'guard-reconcile', trigger, posted_at: at, posted_ts: Date.parse(at) || 0, at: new Date().toISOString() }
-          return withEvent({ ...l, posted: [...l.posted, entry] }, { code: 'ledger-backfilled', bvid: entry.bvid, detail: 'guard 对账补记（' + trigger + '）' })
-        })
+        await whaleLedgerWrite((l) => withBackfill(l, {
+          id: 'wl-guard-' + createHash('sha1').update(String(row.key || row.at || Math.random())).digest('hex').slice(0, 12),
+          bvid: String(row.bvid ?? ''),
+          rpid: String(row.rpid || ''),
+          text: tasteText,
+          aid,
+          mid,
+          source: 'guard-reconcile',
+          trigger,
+          posted_at: at,
+          posted_ts: Date.parse(at) || 0,
+          at: new Date().toISOString(),
+        }))
         log('whale ledger 对账补记：bvid=' + String(row.bvid ?? '') + ' rpid=' + String(row.rpid ?? '') + '（' + trigger + '）')
       }
     } catch (e) { log('whale ledger 对账失败（不致命）：' + String(e?.message ?? e)) }
