@@ -24,10 +24,14 @@ const { apply } = await import('../index.js')
 const BV = 'BV1234567890', SEEN = 'BV1234567891', FRESH = 'BV1234567892'
 const UID = '1234567890123456789', RPID = '2345678901234567890', ROOT = '3456789012345678901', OPUS = '4567890123456789012', SEQ = '5678901234567890123', SENT = '6789012345678901234'
 const TEXT = '镜头停在倒影上的那几秒，水面和光线的变化特别清楚。'
+const NL = String.fromCharCode(10)
+const HOOK = '讲复利那三分钟本鱼来回听了三遍，数字一减就懂了，嘿嘿。'
+const GATE_BLOCK = '鲸鱼整理的《合成的书名》资源包：https://pan.quark.cn/s/synthetic 提取码：sx12'
+const GATE_FOUND = { ok: true, found: true, source: 'ledger', bookId: 'synthetic-book', bookTitle: '合成的书名', disk: 'quark', block: GATE_BLOCK, blockLen: [...GATE_BLOCK].length, fromLedger: true }
 const immediate = () => new Promise(resolve => setImmediate(resolve))
 const successfulContracts = new Set()
 
-/** Executable 39-tool inventory. Every entry runs successfully below and is fenced in ordinary mode.
+/** Executable 40-tool inventory. Every entry runs successfully below and is fenced in ordinary mode.
  * The specialist suites additionally prove the deeper lifecycle/policy named in the final column.
  * New registration without a real contract fails the exact inventory assertion.
  */
@@ -60,6 +64,7 @@ export const TOOL_SURFACE_EVIDENCE = Object.freeze({
   bili_sticker: [{ action: 'list' }, 'local', 'sticker-review-routes.test.mjs'],
   bili_reply: [{ bvid: BV, text: TEXT, picture: '' }, 'send', 'send-review-routes.test.mjs'],
   bili_comment: [{ bvid: BV, text: TEXT, picture: '' }, 'send', 'send-review-routes.test.mjs'],
+  bili_book_comment: [{ bvid: BV, title: '合成的书名', hook: HOOK, picture: '' }, 'send', 'book-comment.test.mjs'],
   bili_status: [{}, 'local', 'product-status-routes.test.mjs'],
   bili_pace: [{ kind: 'reply' }, 'local', 'pace-routes.test.mjs'],
   bili_say: [{ text: '这次合成片段的倒影细节值得保留。', bvid: BV }, 'local', 'manual-browsing.test.mjs'],
@@ -120,7 +125,7 @@ const sourceReply = name => {
   throw new Error('UNEXPECTED_DOWNSTREAM_TOOL: ' + name)
 }
 
-async function fixture(run, { permissions = false, worker = false, login = false, installer = false } = {}) {
+async function fixture(run, { permissions = false, worker = false, login = false, installer = false, gate = null } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'fish-tool-surface-')), home = join(root, 'bili-duty'), cleanups = [], tools = new Map(), events = new Map(), calls = [], subprocesses = [], fetches = [], goals = new Map()
   mkdirSync(home)
   const cli = join(root, 'synthetic-cli.js'); writeFileSync(cli, '// Never executed; child process is mocked.')
@@ -161,6 +166,9 @@ async function fixture(run, { permissions = false, worker = false, login = false
         current.emit('exit', 0)
       }); return current
     }
+    if (gate && String(args?.[0] ?? '').endsWith('client.py')) {
+      queueMicrotask(() => { current.stdout.emit('data', Buffer.from(JSON.stringify(gate))); current.emit('close', 0) }); return current
+    }
     throw new Error('UNEXPECTED_SUBPROCESS_IN_SURFACE_FIXTURE')
   }; syncBuiltinESMExports()
   globalThis.fetch = async url => {
@@ -182,9 +190,9 @@ async function fixture(run, { permissions = false, worker = false, login = false
   }
   try {
     apply(ctx, {}); await immediate()
-    assert.deepEqual([...tools.keys()].sort(), Object.keys(TOOL_SURFACE_EVIDENCE).sort()); assert.equal(tools.size, 39)
+    assert.deepEqual([...tools.keys()].sort(), Object.keys(TOOL_SURFACE_EVIDENCE).sort()); assert.equal(tools.size, 40)
     await run({ root, home, fish, normal, goals, tools, calls, subprocesses, fetches, execute, request, child: () => child, async select(preset) { fish.session.header.agentPreset = preset; for (const fn of events.get('agent-preset/selected') || []) await fn(fish.id, preset); await immediate() } })
-    if (!worker && !login && !installer) assert.deepEqual(subprocesses, [], 'read/local/send fixture must not run Python or any subprocess')
+    if (!worker && !login && !installer && !gate) assert.deepEqual(subprocesses, [], 'read/local/send fixture must not run Python or any subprocess')
     if (!login) assert.deepEqual(fetches, [], 'MCP fixtures must not call a network endpoint')
   } finally {
     for (const off of cleanups.reverse()) try { await off() } catch {}
@@ -245,7 +253,7 @@ for (const [name, downstream] of Object.entries(downstreamSend)) test(`${name} s
 }, { permissions: true }))
 
 test('every sending wrapper refuses valid content with disabled permissions and performs zero account IO', async () => fixture(async f => {
-  for (const name of Object.keys(downstreamSend)) assert.equal((await f.execute(name)).blocked, true, name)
+  for (const name of [...Object.keys(downstreamSend), 'bili_book_comment']) assert.equal((await f.execute(name)).blocked, true, name)
   assert.deepEqual(f.calls, [])
 }))
 
@@ -299,7 +307,7 @@ test('bili_setup executes the actual installer to completion using only mocked p
   assert.fail('the controlled setup tool did not finish')
 }, { installer: true }))
 
-test('all 39 ordinary-session and post-exit stale handles fail mode_required before account, network or process IO', async () => fixture(async f => {
+test('all 40 ordinary-session and post-exit stale handles fail mode_required before account, network or process IO', async () => fixture(async f => {
   const handles = new Map(f.tools)
   for (const [name, spec] of handles) {
     const out = await spec.execute(structuredClone(TOOL_SURFACE_EVIDENCE[name][0]), { agent: f.normal })
@@ -310,8 +318,39 @@ test('all 39 ordinary-session and post-exit stale handles fail mode_required bef
   assert.deepEqual(f.calls, []); assert.deepEqual(f.fetches, []); assert.deepEqual(f.subprocesses, [])
 }))
 
-test('the 39-item evidence matrix references existing portable specialist suites', () => {
-  assert.equal(Object.keys(TOOL_SURFACE_EVIDENCE).length, 39)
+test('bili_book_comment composes hook+block through the gate and sends through the shared chain', async () => fixture(async f => {
+  const out = await f.execute('bili_book_comment', { bvid: BV, title: '合成的书名', hook: HOOK, picture: '' })
+  assert.equal(out.success, true, JSON.stringify(out))
+  assert.equal(out.book_comment.found, true)
+  assert.equal(out.book_comment.source, 'ledger')
+  assert.equal(out.book_comment.bookId, 'synthetic-book')
+  assert.equal(out.book_comment.sent, true)
+  assert.ok(!JSON.stringify(out).includes('pan.quark'), 'model-facing result must not contain the block')
+  assert.ok(f.calls.some(row => row.name === 'bili_video_info'), 'UP uid is fetched before the gate')
+  const sent = f.calls.find(row => row.name === 'bili_reply')
+  assert.equal(sent.args.rpid, '0', 'book review is always a fresh comment')
+  assert.equal(sent.args.text, HOOK + NL + GATE_BLOCK)
+  const st = existsSync(join(f.home, 'state.json')) ? JSON.parse(readFileSync(join(f.home, 'state.json'), 'utf8')) : {}
+  assert.ok(st.repliedComments['nu:' + BV], 'nu: key written by the shared chain')
+  assert.ok(st.repliedComments['book:synthetic-book'], 'book: key written after success')
+  assert.equal(st.repliedComments['book:synthetic-book'].bvid, BV)
+  assert.ok(st.repliedComments['up:' + UID], 'up: key written after success')
+  assert.equal(st.repliedComments['up:' + UID].uid, UID)
+}, { permissions: true, gate: GATE_FOUND }))
+
+test('bili_book_comment gate-miss sends nothing and writes no dedup key', async () => fixture(async f => {
+  const out = await f.execute('bili_book_comment', { bvid: BV, title: '没资源的书', hook: HOOK })
+  assert.equal(out.ok, false)
+  assert.equal(out.blocked, true)
+  assert.equal(out.code, 'gate-miss')
+  assert.ok(!f.calls.some(row => row.name === 'bili_reply'), 'miss must not send')
+  const st = existsSync(join(f.home, 'state.json')) ? JSON.parse(readFileSync(join(f.home, 'state.json'), 'utf8')) : {}
+  const keys = Object.keys(st.repliedComments || {})
+  assert.ok(!keys.some(key => key.startsWith('book:') || key.startsWith('up:') || key === 'nu:' + BV), 'miss writes no dedup key (spec §5.2 step 3)')
+}, { permissions: true, gate: { ok: true, found: false } }))
+
+test('the 40-item evidence matrix references existing portable specialist suites', () => {
+  assert.equal(Object.keys(TOOL_SURFACE_EVIDENCE).length, 40)
   assert.deepEqual([...successfulContracts].sort(), Object.keys(TOOL_SURFACE_EVIDENCE).sort(), 'every registered tool must have completed a positive contract, not merely an invalid-input refusal')
   for (const [name, [args, category, file]] of Object.entries(TOOL_SURFACE_EVIDENCE)) {
     assert.ok(args && typeof args === 'object' && !Array.isArray(args), name)

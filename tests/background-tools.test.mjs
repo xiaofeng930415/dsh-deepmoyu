@@ -10,7 +10,7 @@ import { createRelayClient, createRelayAdapter } from '../lib/model-relay-adapte
 import { RELAY_PROVIDER } from '../lib/model-relay.mjs'
 import { McpClient } from '../lib/mcp.mjs'
 import { backgroundMcpRequest } from '../lib/background-mcp.mjs'
-import { backgroundToolNames, toolInputSchema, validateToolArguments } from '../lib/background-tools.mjs'
+import { backgroundToolNames, exposeBackgroundTools, toolInputSchema, validateToolArguments } from '../lib/background-tools.mjs'
 
 // No Python, credentials or Bilibili requests: exercise the real parent wrappers via localhost MCP.
 test('background MCP shares host activity, pending learning, usage and live automation switches', async () => {
@@ -59,7 +59,7 @@ test('background MCP shares host activity, pending learning, usage and live auto
     assert.match(overlay, /background-mcp\.mjs/); assert.doesNotMatch(overlay, /mcp_server\.py|BILI_DUTY_RELAY_CAPABILITY/)
     const client = createRelayClient(childEnv), list = (await backgroundMcpRequest({ id: 1, method: 'tools/list' }, client)).result.tools
     assert.ok(list.some(x => x.name === 'bili_reply')); assert.ok(list.some(x => x.name === 'bili_learn'))
-    for (const name of ['bili_dm_reply', 'bili_moment', 'bili_config', 'bili_run', 'bili_setup']) assert.ok(!list.some(x => x.name === name), name)
+    for (const name of ['bili_dm_reply', 'bili_moment', 'bili_config', 'bili_run', 'bili_setup', 'bili_comment', 'bili_book_comment']) assert.ok(!list.some(x => x.name === name), name)
     assert.ok(!('force' in list.find(x => x.name === 'bili_reply').inputSchema.properties))
     let seq = 1
     const call = async (name, args) => {
@@ -177,11 +177,25 @@ test('stopping during DM qualification never submits a new send after the pendin
   }
 })
 
-test('background schemas preserve ID strings and reject fabricated human authorization', () => {
+test('background schemas preserve ID strings and reject fabricated human authorization', async () => {
   const schema = toolInputSchema({ id: { type: 'string', required: true }, force: { type: 'boolean' }, action: { type: 'string', enum: ['read', 'add'] } })
   assert.deepEqual(schema.required, ['id'])
   assert.deepEqual(validateToolArguments(schema, { id: '1234567890123456789', action: null }), { id: '1234567890123456789' })
   for (const bad of [{ id: 1234567890123456789 }, { id: 'x', force: true }, { id: 'x', action: 'approve' }, {}]) assert.throws(() => validateToolArguments(schema, bad), /BACKGROUND_TOOL_/)
   assert.ok(!backgroundToolNames({}).includes('bili_reply'))
   assert.ok(backgroundToolNames({ autoReplyDm: true }).includes('bili_dm_reply'))
+  // 🐋 后台白名单收窄（规格 §5.4）：无人值守只给书评通道，普通新评论只保留在会话态
+  const backgroundNames = backgroundToolNames({ autoComment: true })
+  assert.ok(backgroundNames.includes('bili_book_comment'))
+  assert.ok(!backgroundNames.includes('bili_comment'))
+  // 后台的 bili_reply 只许回楼层：模型看见的 schema rpid 必填（§5.4）；调用校验仍按宿主原始
+  // schema（rpid 可缺省），"开关关着 → BACKGROUND_TOOL_DISABLED"先发生；真正的 rpid 拦截在
+  // 宿主回调的白名单检查之后（见 index.js）。
+  const registry = new Map([['bili_reply', { name: 'bili_reply', description: '', parameters: { bvid: { type: 'string' }, text: { type: 'string' }, rpid: { type: 'string' } } }]])
+  const [replyTool] = exposeBackgroundTools(registry, { autoComment: true }, async () => ({}))
+  assert.ok(replyTool.inputSchema.required.includes('rpid'))
+  const executed = []
+  const [lenient] = exposeBackgroundTools(registry, { autoComment: true }, async (name, args) => { executed.push(args); return {} })
+  await lenient.execute({ bvid: 'BV1234567890', text: 'x' }, null)
+  assert.deepEqual(executed, [{ bvid: 'BV1234567890', text: 'x' }])
 })
