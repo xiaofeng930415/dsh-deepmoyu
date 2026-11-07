@@ -22,7 +22,7 @@ import { loadHostDeps } from './lib/hostdeps.mjs'
 const hostDeps = await loadHostDeps()
 const z = hostDeps.z
 const defineTool = hostDeps.defineTool
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { appendFileSync, closeSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { createRequire } from 'node:module'
@@ -89,6 +89,7 @@ import {
 // ✍️ 评论质量的**硬下限**（只判"有没有内容"，不判好不好）—— 2026-10-20 使用者要求「不能单纯为了哗众取宠」
 import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK, bookHookOf } from './lib/comment.mjs'
 import { callBookGate } from './lib/book-gate.mjs'
+import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, missingGuardSends, writeWhaleLedgerFile } from './lib/whale-ledger.mjs'
 // 🧠 口味本子：把自己发出去的评论和被赞数对上，算出哪种说话方式有人爱听 —— 2026-10-20 使用者要的
 import { tasteRemember, tasteApplyLikes, tasteStats, tasteDigest, tasteTop, tasteMirror, TASTE_MIN_N } from './lib/taste.mjs'
 // 🎓 自主学习：学到的先进待审队列，批准了才注入提示词 —— 2026-10-21 使用者第 2 条要求
@@ -2873,8 +2874,32 @@ export function apply(ctx, config) {
     'claim-orphan-suspect': '疑似孤儿分享（claim-orphan-suspect）——不评论，转人工核对。',
     'render-error': '口令块渲染异常（render-error）——不发、不重试，这是实现缺陷信号。',
   }
+  /* 📇 鲸鱼 ledger（规格 §10.1）：三写入点 + 失败事件，宿主写、模型不可见也不可写。
+   *  落点 = DUTY 家 whale-book-comment/ledger.json（规格字面主仓 .context/ 路径运行时不可达——
+   *  批运行 cwd=插件家；仓内镜像与上报由 push 侧从 DUTY 家读取，偏差记入 #1661）。
+   *  原子写（writeJson）+ withStateLock 串行，跟 state.json 一把锁。 */
+  const whaleLedgerPath = () => whaleLedgerFile(stateDir)
+  const whaleLedgerWrite = (mutate) => withStateLock(() => {
+    const ledger = mutate(readJson(whaleLedgerPath(), emptyLedger()))
+    writeWhaleLedgerFile(stateDir, ledger)
+    return ledger
+  })
+  const whaleLedgerEvent = async (code, detail, extra = {}) => {
+    try { await whaleLedgerWrite((l) => withEvent(l, { code, detail, ...extra })) } catch (e) { log('whale ledger 事件写入失败（不致命）：' + String(e?.message ?? e)) }
+  }
+
   const composeBookComment = async (args, exec) => {
-    const blocked = (extra) => ({ ok: false, blocked: true, tool: 'bili_book_comment', ...extra })
+    const bvidRef = { v: '' }, titleRef = { v: '' }
+    const blocked = (extra) => {
+      const code = String(extra.code || '')
+      // 📇 事件码进 ledger（规格 §10.1 events[]，可追加）：hook-over 映射为规格名 hook-over-budget；
+      //    posture 拦截（无 code 的开关闭合）不记，避免开关未开时刷事件。
+      if (code) {
+        const map = { 'hook-over': 'hook-over-budget' }
+        whaleLedgerEvent(map[code] || code, String(extra.hint ?? ''), { bvid: bvidRef.v, bookId: titleRef.v })
+      }
+      return { ok: false, blocked: true, tool: 'bili_book_comment', ...extra }
+    }
     /* ⓪ 授权面：与 bili_comment 共用「自动评论视频」开关。开关没开就不跑书源门——
      *    gate 在网盘分支会触发不可逆的 claim，未授权时连只读台账查询也不空跑。 */
     if (cfg.dmMode === 'only' || !cfg.autoComment) {
@@ -2885,6 +2910,8 @@ export function apply(ctx, config) {
     const title = String(args.title ?? '').trim()
     const hook = String(args.hook ?? '').trim()
     const hookLen = Array.from(hook).length
+    bvidRef.v = bvid
+    titleRef.v = title
     if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) {
       return blocked({ code: 'hook-invalid', hook_used: hookLen, hint: 'bvid 必须是 BV + 10 位字母数字（拿到「' + bvid.slice(0, 40) + '」）。' })
     }
@@ -2937,13 +2964,18 @@ export function apply(ctx, config) {
     if (textLen > 150) {
       return blocked({ code: 'hook-over', hook_used: hookLen, hook_left: 90, block_len: blockLen, hint: '全文 ' + textLen + ' 字，超 150 上限 ' + (textLen - 150) + ' 字 —— 把 hook 删到 ' + Math.max(0, hookLen - (textLen - 150)) + ' 字以内再调一次（同轮最多重写 1 次，不截断、不降级）。' })
     }
-    /* ⑤ 写进**同一个 args 对象**（审批路径靠对象身份免重跑，§5.3），元数据留给执行层记账。 */
+    /* ⑤ 写进**同一个 args 对象**（审批路径靠对象身份免重跑，§5.3），元数据留给执行层记账。
+     *  📇 WP1 书源门命中（规格 §10.1）：book_id/book_title/link/code/disk/from_ledger/job_id/
+     *     candidate_id —— link 与 code 从口令块文本解析（块就是要发出去的链接，宿主拼接过）。 */
+    const wlId = 'wl-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+    await whaleLedgerWrite((l) => withGateHit(l, { id: wlId, bvid, bookId, bookTitle: title, block, fromLedger: gate.fromLedger === true, jobId: gate.jobId ?? null, candidateId: gate.candidateId ?? null, ledgerLookup: String(gate.source ?? '') }))
     args.text = text
     args.bookId = bookId
     args.gateSource = String(gate.source ?? '')
     args.blockLen = String(blockLen)
     args.upUid = upUid
-    bookComposedArgs.set(args, { bookId, source: String(gate.source ?? ''), blockLen, upUid, hookUsed: hookLen })
+    args.wlId = wlId
+    bookComposedArgs.set(args, { bookId, source: String(gate.source ?? ''), blockLen, upUid, hookUsed: hookLen, wlId })
     return null
   }
 
@@ -2968,6 +3000,7 @@ export function apply(ctx, config) {
       gateSource: { type: 'string', description: '（宿主注入，勿填）书源门命中来源（ledger/netdisk）' },
       blockLen: { type: 'string', description: '（宿主注入，勿填）口令块字数' },
       upUid: { type: 'string', description: '（宿主注入，勿填）UP 主 uid，发送成功后记账用' },
+      wlId: { type: 'string', description: '（宿主注入，勿填）本地 ledger 记录 id' },
     },
     async execute(args, exec) {
       const approved = approvedReviewArgs.get(args)
@@ -2977,15 +3010,32 @@ export function apply(ctx, config) {
             source: String(args.gateSource ?? ''),
             blockLen: Number(args.blockLen) || 0,
             upUid: String(args.upUid ?? ''),
+            wlId: String(args.wlId ?? ''),
             hookUsed: Array.from(String(args.hook ?? '').trim()).length,
           }
         : bookComposedArgs.get(args)
       if (!info) {
         return { ok: false, blocked: true, tool: 'bili_book_comment', code: 'gate-error', hint: '书评组合阶段没有先运行 —— 直接调 bili_book_comment({bvid,title,hook}) 让宿主先走书源门与注入，不要手工构造参数。' }
       }
+      /* 📇 WP2 发前（规格 §10.1）：hook / block / order_kind(quark|baidu) / like_line / 字数。
+       *  block 取组合不变量的第二段（text = hook + 换行 + block）。 */
+      const wlHook = String(args.hook ?? '').trim()
+      const wlText = String(args.text ?? '')
+      const wlNl = wlText.indexOf('\n')
+      const wlBlock = wlNl >= 0 ? wlText.slice(wlNl + 1) : ''
+      await whaleLedgerWrite((l) => withBeforeSend(l, info.wlId, { hook: wlHook, block: wlBlock, charCount: Array.from(wlText).length }))
       /* 发送链与 bili_comment 同一条薄壳：质量闸（书评官腔降 warn）、模板判重（只比钩子）、
        * 判重 nu:、pace、风控、Python 占坑全在 replyTool.execute 里照旧跑。 */
       const out = await replyTool.execute(args, exec, '0', { bookReview: true })
+      /* 📇 WP3 发后（规格 §10.1）：rpid（十进制字符串）/ guard_status / posted_at / posted_ts。 */
+      const wlRpid = readableId(out?.rpid_str ?? out?.rpid ?? '0')
+      const wlSent = sendOk(out)
+      const wlGuard = String(out?.guard_status || (wlSent ? 'sent' : out?.blocked ? (out?.pace ? 'pace-blocked' : 'blocked') : 'unknown'))
+      await whaleLedgerWrite((l) => withAfterSend(l, info.wlId, { rpid: wlRpid, guardStatus: wlGuard, sent: wlSent, errorCode: out?.code ?? null, postedAt: wlSent ? new Date().toISOString() : '' }))
+      if (!wlSent) {
+        const wlCode = out?.code != null ? String(out.code) : ''
+        await whaleLedgerEvent(wlCode ? 'send-rejected:' + wlCode : 'send-unknown', String(out?.error || out?.hint || ''), { bvid: String(args.bvid ?? ''), bookId: info.bookId })
+      }
       /* 📇 发送成功才记账 book:/up:（§8.3 只发成功后写，不预占）；nu:/taste/seen 由发送链自己写。 */
       if (sendOk(out)) {
         const rpid = readableId(out.rpid_str ?? out.rpid ?? '0')
@@ -3520,6 +3570,7 @@ export function apply(ctx, config) {
     if (!claimed?.ok) return claimed
     if (decision === 'reject') {
       act('note', `已拒绝${target.kind}预览`, { reviewId: key })
+      if (target.tool === 'bili_book_comment') await whaleLedgerEvent('skipped:review-rejected', '预览被本人拒绝', { bvid: String(target.args?.bvid ?? ''), bookId: String(target.args?.bookId ?? '') })
       return { ok: true, item: { ...target, state: 'rejected' } }
     }
     const wrapped = backgroundToolRegistry.get(target.tool)
@@ -3556,6 +3607,43 @@ export function apply(ctx, config) {
     })
     act(sent ? 'done' : 'error', `${sent ? '已批准并发送' : '批准后发送失败'}${target.kind}预览`, { reviewId: key })
     return { ok: sent, sent, item: { ...target, state: stateName, result: safe(output) }, result: safe(output), error: sent ? '' : output?.hint || output?.error || '发送结果未知，请去 B站核对' }
+  }
+
+  /* 🧾 guard 对账自愈（规格 §10.1）：批起止各跑一次**只读**快照（runtime_guard.py --limit 200），
+   *  kind='send' 且 status='sent' 的行与鲸鱼 ledger 求差集；缺记条目用 taste[rpid] 补正文、
+   *  bili_video_info 补 aid/mid 后补写 ledger（source=guard-reconcile，字段 backfill:true）。
+   *  只补「正文带网盘链接」的行 —— 普通评论也走 guard 占坑，但它们不属于书评线账本。
+   *  失败不致命（对账是兜底，不是主链路）。 */
+  const reconcileWhaleLedger = async (trigger) => {
+    try {
+      if (!existsSync(join(stateDir, 'runtime-guard.sqlite3'))) return
+      const r = spawnSync('python3', [join(stateDir, 'runtime_guard.py'), '--home', stateDir, '--limit', '200'], { encoding: 'utf8', timeout: 25000 })
+      const snap = JSON.parse(r.stdout || 'null')
+      const rows = Array.isArray(snap?.recentSends) ? snap.recentSends.filter((x) => x?.status === 'sent') : []
+      let missing = []
+      await whaleLedgerWrite((l) => { missing = missingGuardSends(rows, l); return l })
+      if (!missing.length) return
+      for (const row of missing.slice(0, 20)) {
+        const st = readJson(dutyStateFile, {})
+        const tasteText = String(st?.taste?.[String(row.rpid ?? '')]?.text ?? '')
+        if (!/pan\.quark\.cn|pan\.baidu\.com/.test(tasteText)) continue
+        let aid = ''
+        let mid = ''
+        try {
+          const info = await call('bili_video_info', { bvid: String(row.bvid ?? '') })
+          aid = String(info?.aid ?? '')
+          mid = readableId(info?.owner?.mid ?? '') || String(info?.owner?.mid ?? '')
+        } catch { /* 补不上就不补这两个字段 */ }
+        const at = String(row.at || new Date().toISOString())
+        await whaleLedgerWrite((l) => {
+          const id = 'wl-guard-' + createHash('sha1').update(String(row.key || row.at || Math.random())).digest('hex').slice(0, 12)
+          if (l.posted.some((x) => x.id === id)) return l
+          const entry = { id, bvid: String(row.bvid ?? ''), rpid: String(row.rpid || ''), text: tasteText, aid, mid, backfill: true, source: 'guard-reconcile', trigger, posted_at: at, posted_ts: Date.parse(at) || 0, at: new Date().toISOString() }
+          return withEvent({ ...l, posted: [...l.posted, entry] }, { code: 'ledger-backfilled', bvid: entry.bvid, detail: 'guard 对账补记（' + trigger + '）' })
+        })
+        log('whale ledger 对账补记：bvid=' + String(row.bvid ?? '') + ' rpid=' + String(row.rpid ?? '') + '（' + trigger + '）')
+      }
+    } catch (e) { log('whale ledger 对账失败（不致命）：' + String(e?.message ?? e)) }
   }
 
   /* ── ⏱️ 出手节奏（2026-10-21 使用者 m18802 第 1、2 条）────────────────────────
@@ -4623,6 +4711,7 @@ export function apply(ctx, config) {
       bumpState(patch).catch(() => {})
     } catch { /* pid/起点落盘失败只影响孤儿认领与休息判据 */ }
     petLog('bg-start', { runId: runState.id, task: runState.task, why, model: run.model, tokenBudget: run.tokenBudget, deadlineAt: runState.deadlineAt })
+    reconcileWhaleLedger('批起')
     if (dutyTimer) { clearTimeout(dutyTimer); dutyTimer = null }
     dutyTimer = scheduleRunDeadline(backgroundRun.deadlineAt, () => {
       if (dutyChild !== child) return
@@ -4644,6 +4733,7 @@ export function apply(ctx, config) {
     let finalized = false
     // 'close', not 'exit': stderr's final NO_ADAPTER/error line may still be in the pipe on exit.
     child.on('close', (code, signal) => {
+      reconcileWhaleLedger('批止')
       if (finalized) return
       finalized = true; output.flush()
       if (!runState.stopReason && (code !== 0 || runState.error)) runState.error = output.lastError || runState.error || `后台进程退出码 ${code}${signal ? '，信号 ' + signal : ''}`

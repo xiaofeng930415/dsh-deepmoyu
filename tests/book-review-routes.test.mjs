@@ -11,7 +11,7 @@ import { McpClient } from '../lib/mcp.mjs'
 const NL = String.fromCharCode(10)
 const BV = 'BV1234567890', UID = '3707002496747705', SENT = '6789012345678901234'
 const HOOK = '讲复利那三分钟本鱼来回听了三遍，数字一减就懂了，嘿嘿。'
-const BLOCK = '鲸鱼整理的《合成的书名》资源包：https://pan.quark.cn/s/synthetic 提取码：sx12'
+const BLOCK = ['鲸鱼整理的《合成的书名》资源包', 'https://pan.quark.cn/s/synthetic', '提取码：sx12'].join(NL)
 const GATE_FOUND = { ok: true, found: true, source: 'ledger', bookId: 'synthetic-book', bookTitle: '合成的书名', disk: 'quark', block: BLOCK, blockLen: [...BLOCK].length, fromLedger: true }
 const flush = () => new Promise(resolve => setImmediate(resolve))
 
@@ -85,6 +85,22 @@ test('book review queues the final composed bytes and approval sends them withou
     assert.equal(st.repliedComments['up:' + UID].uid, UID)
     assert.equal(st.unrelated, 61, '原有 state 字段不被破坏')
     assert.equal((await request('/status')).body.sendReview.counts.sent, 1)
+    // 📇 规格 §10.1：本地 ledger 三写入点一次走全（宿主写、含链接，模型不可见）
+    const ledger = JSON.parse(readFileSync(join(home, 'whale-book-comment', 'ledger.json'), 'utf8'))
+    assert.equal(ledger.posted.length, 1, JSON.stringify(ledger))
+    const rec = ledger.posted[0]
+    assert.equal(rec.book_id, 'synthetic-book')
+    assert.equal(rec.link, 'https://pan.quark.cn/s/synthetic', 'WP1 的 link 从口令块解析')
+    assert.equal(rec.code, 'sx12')
+    assert.equal(rec.disk, 'quark')
+    assert.equal(rec.from_ledger, true)
+    assert.equal(rec.hook, HOOK)
+    assert.equal(rec.order_kind, 'quark')
+    assert.equal(rec.like_line, '')
+    assert.ok(rec.char_count >= HOOK.length + BLOCK.length)
+    assert.equal(rec.rpid, SENT)
+    assert.equal(rec.guard_status, 'sent')
+    assert.ok(rec.posted_ts > 0)
   } finally {
     for (const fn of cleanups.reverse()) try { fn() } catch {}
     cp.spawn = originalSpawn; syncBuiltinESMExports(); McpClient.prototype.call = original
@@ -141,6 +157,10 @@ test('book review reject keeps the claim result unused and sends nothing; permis
     const st = JSON.parse(readFileSync(join(home, 'state.json'), 'utf8'))
     const keys = Object.keys(st.repliedComments || {})
     assert.ok(!keys.some(key => key.startsWith('book:') || key.startsWith('up:') || key === 'nu:' + BV), '拒绝不写任何判重键（claim 结果等下次 gate 复用）')
+    const wl = JSON.parse(readFileSync(join(home, 'whale-book-comment', 'ledger.json'), 'utf8'))
+    assert.equal(wl.posted.length, 1, 'WP1 在组合成功时已建行')
+    assert.ok(!wl.posted[0].rpid, '拒绝后没有发后字段')
+    assert.ok(wl.events.some(e => e.code === 'skipped:review-rejected'), '拒绝事件留痕')
     // 关掉 autoComment：连 gate 都不跑（claim 有不可逆副作用，未授权不空跑）
     await request('/config', { autoComment: false })
     const before = spawns.length
