@@ -49,7 +49,7 @@ import { appendActivityRecord, readActivityTail, rotateActivityLog, importActivi
 import { withFileLockSync, readJsonFileSync, atomicWriteFileSync } from './lib/record-storage.mjs'
 import { MEMORY_SOURCES, memoryCenterSnapshot, memoryFingerprint } from './lib/memory-center.mjs'
 import { normalizeId, optionalId, readableId, replyTargetId } from './lib/ids.mjs'
-import { verifyRecent, appendVerifyToReport } from './lib/verify.mjs'
+import { verifyRecent, appendVerifyToReport, verifyOne, replyDetail, loadCredential, headersFor } from './lib/verify.mjs'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow,
   dayKey, dayResetPatch, resetDayCounters } from './lib/state.mjs'
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
@@ -89,7 +89,10 @@ import {
 // ✍️ 评论质量的**硬下限**（只判"有没有内容"，不判好不好）—— 2026-10-20 使用者要求「不能单纯为了哗众取宠」
 import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK, bookHookOf } from './lib/comment.mjs'
 import { callBookGate } from './lib/book-gate.mjs'
-import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile } from './lib/whale-ledger.mjs'
+import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile, withV1Result, withIngest, dueV1Checks, selectPendingIngest } from './lib/whale-ledger.mjs'
+// 🐋 鲸鱼书评线 V1 核验（§10.3）与入库上报（§10.2，vendor 逐字副本 push.py 通道）
+import { sweepV1 } from './lib/whale-verify.mjs'
+import { ingestRows } from './lib/whale-push.mjs'
 // 🧠 口味本子：把自己发出去的评论和被赞数对上，算出哪种说话方式有人爱听 —— 2026-10-20 使用者要的
 import { tasteRemember, tasteApplyLikes, tasteStats, tasteDigest, tasteTop, tasteMirror, TASTE_MIN_N } from './lib/taste.mjs'
 // 🎓 自主学习：学到的先进待审队列，批准了才注入提示词 —— 2026-10-21 使用者第 2 条要求
@@ -2934,9 +2937,10 @@ export function apply(ctx, config) {
     /* uid 取不到的瞬间失败也要留证（上一轮真机两次 122ms 失败但错误被吞）⇒ 单次重试吸收抖动，错误进事件 detail */
     let upUid = ''
     let uidErr = ''
+    let videoInfo = null
     for (let uidAttempt = 1; uidAttempt <= 2 && !upUid; uidAttempt++) {
       try {
-        const videoInfo = await call('bili_video_info', { bvid })
+        videoInfo = await call('bili_video_info', { bvid })
         upUid = readableId(videoInfo?.owner?.mid, { allowZero: false })
         if (!upUid) uidErr = '回执缺 owner.mid（bvid=' + bvid + '）'
       } catch (e) {
@@ -2976,7 +2980,7 @@ export function apply(ctx, config) {
      *    link(从块解析) / code / disk / from_ledger / job_id / candidate_id；
      *    后续 hook-over 等只补事件（§8.4 记 skipped 原因），发送字段由 WP2/WP3 真正发送时补全。 */
     const wlId = 'wl-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-    await whaleLedgerWrite((l) => withGateHit(l, { id: wlId, bvid, bookId, bookTitle: title, block, fromLedger: gate.fromLedger === true, jobId: gate.jobId ?? null, candidateId: gate.candidateId ?? null, ledgerLookup: String(gate.source ?? '') }))
+    await whaleLedgerWrite((l) => withGateHit(l, { id: wlId, bvid, bookId, bookTitle: title, block, fromLedger: gate.fromLedger === true, jobId: gate.jobId ?? null, candidateId: gate.candidateId ?? null, ledgerLookup: String(gate.source ?? ''), aid: videoInfo?.aid, mid: upUid, entryStat: videoInfo ? { view: videoInfo?.stat?.view, reply: videoInfo?.stat?.reply, like: videoInfo?.stat?.like, danmaku: videoInfo?.stat?.danmaku, pubdate_ts: videoInfo?.pubdate } : null }))
     /* ④ 注入：text = hook + 换行 + block，硬上限 150（§5.2 步骤 4：超预算回精确剩余字数，允许重写 1 次；
      *    不截断、不降级成裸口令块）。 */
     const text = hook + '\n' + block
@@ -3071,6 +3075,13 @@ export function apply(ctx, config) {
           if (info.upUid) st.repliedComments = dupRemember(st.repliedComments, keyUp(info.upUid), { ...rec, uid: info.upUid })
           writeJson(dutyStateFile, st)
         })
+        /* ⏱️ V1 核验定时（§10.3）：进程活着就到点跑；死了由下一批起止 sweep 兜底（只晚不缺）。 */
+        for (const ms of [30 * 60_000, 24 * 3600_000]) {
+          const t = setTimeout(() => sweepWhaleV1('定时'), ms)
+          t?.unref?.()
+        }
+        /* 📤 发时入库（§10.2）：comments + videoSnapshots(source='entry')，异步 fail-open。 */
+        pushWhalePending('发后')
       }
       /* 模型可见面（§5.2 步骤 7）：有没有、几字、发没发 —— 永远没有 block/链接字段。 */
       return {
@@ -3678,6 +3689,7 @@ export function apply(ctx, config) {
           id: 'wl-guard-' + createHash('sha1').update(String(row.key || row.at || Math.random())).digest('hex').slice(0, 12),
           bvid: String(row.bvid ?? ''),
           rpid: String(row.rpid || ''),
+          sent: true,
           text: tasteText,
           aid,
           mid,
@@ -3690,6 +3702,48 @@ export function apply(ctx, config) {
         log('whale ledger 对账补记：bvid=' + String(row.bvid ?? '') + ' rpid=' + String(row.rpid ?? '') + '（' + trigger + '）')
       }
     } catch (e) { log('whale ledger 对账失败（不致命）：' + String(e?.message ?? e)) }
+  }
+
+  /* ── 🐋 V1 核验 + 入库上报（规格 §10.2/§10.3；T5b）────────────────────────
+   * V1（§10.3）：T+30min / T+24h 各一次，登录态 reply/main 判「列表可见」，结果只写本地 ledger
+   *   （hit / invisible / miss + likes/floor），不写服务端 visibility；floor 只在命中后用 reply/detail
+   *   补（不作判据）。调度：批起/批止 sweep 兜底（进程死了只晚不缺）+ 发送后 setTimeout 到点即查。
+   * 入库（§10.2）：发时推 comments + videoSnapshots(source='entry')，通道 = vendor/bili-push/push.py
+   *   逐字副本（SSH + 服务器本地 ADMIN_TOKEN，token 不出服务器）。失败 fail-open：ledger 仍是唯一
+   *   权威，下一批起止重试（≤5 次封口留痕，事件 ingest-failed）；rpid 超安全整数直接封口（§10.2）。 */
+  const whalePushScript = join(pluginDir, 'vendor', 'bili-push', 'push.py')
+  const whalePyBin = () => {
+    const vp = venvPython()
+    return existsSync(vp) ? vp : 'python3'
+  }
+  const sweepWhaleV1 = (trigger) => {
+    const cred = loadCredential(stateDir)
+    if (!cred) return
+    sweepV1({
+      trigger,
+      readLedger: () => readJson(whaleLedgerPath(), emptyLedger()),
+      writeRow: whaleLedgerWrite,
+      cred,
+      log: (m) => log(m),
+    }).catch((e) => log('whale V1 核验失败（不致命）：' + String(e?.message ?? e)))
+  }
+  const pushWhalePending = (trigger) => {
+    const run = async () => {
+      let rows = []
+      await whaleLedgerWrite((l) => { rows = selectPendingIngest(l, { max: 5 }); return l })
+      if (!rows.length) return
+      const outcomes = await ingestRows({ rows, pythonBin: whalePyBin(), scriptPath: whalePushScript, timeoutMs: 60000, log: (m) => log(m) })
+      for (const o of outcomes) {
+        if (!o.id) continue
+        const attempts = Number(o.row?.ingest_attempts ?? 0) + (o.ok === true ? 0 : 1)
+        const givenUp = o.ok !== true && attempts >= 5
+        await whaleLedgerWrite((l) => withIngest(l, o.id, o.ok === true
+          ? { ok: true, counts: o.counts ?? null }
+          : { ok: false, error: o.error, givenUp }))
+        if (givenUp) await whaleLedgerEvent('ingest-failed', '入库重试 ' + attempts + ' 次后放弃：' + String(o.error ?? ''), {})
+      }
+    }
+    run().catch((e) => log('whale ingest 推送失败（不致命）：' + String(e?.message ?? e)))
   }
 
   /* ── ⏱️ 出手节奏（2026-10-21 使用者 m18802 第 1、2 条）────────────────────────
@@ -4758,6 +4812,8 @@ export function apply(ctx, config) {
     } catch { /* pid/起点落盘失败只影响孤儿认领与休息判据 */ }
     petLog('bg-start', { runId: runState.id, task: runState.task, why, model: run.model, tokenBudget: run.tokenBudget, deadlineAt: runState.deadlineAt })
     reconcileWhaleLedger('批起')
+    sweepWhaleV1('批起')
+    pushWhalePending('批起')
     if (dutyTimer) { clearTimeout(dutyTimer); dutyTimer = null }
     dutyTimer = scheduleRunDeadline(backgroundRun.deadlineAt, () => {
       if (dutyChild !== child) return
@@ -4780,6 +4836,8 @@ export function apply(ctx, config) {
     // 'close', not 'exit': stderr's final NO_ADAPTER/error line may still be in the pipe on exit.
     child.on('close', (code, signal) => {
       reconcileWhaleLedger('批止')
+      sweepWhaleV1('批止')
+      pushWhalePending('批止')
       if (finalized) return
       finalized = true; output.flush()
       if (!runState.stopReason && (code !== 0 || runState.error)) runState.error = output.lastError || runState.error || `后台进程退出码 ${code}${signal ? '，信号 ' + signal : ''}`
