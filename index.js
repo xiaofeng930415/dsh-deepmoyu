@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url'
 import { McpClient } from './lib/mcp.mjs'
 import { resolveSessionPreset, personaScope, isFeiyuGoal, CHARACTER_COMPASS } from './lib/mode.mjs'
 import { createToolScopeRegistry } from './lib/tool-scope.mjs'
-import { buildFeiyuObjective, buildLiveBrief, MOMENT_OPENING_KEEP, interactionStyleGuide } from './lib/prompts.mjs'
+import { buildFeiyuObjective, buildLiveBrief, bookFocusBrief, MOMENT_OPENING_KEEP, interactionStyleGuide } from './lib/prompts.mjs'
 import { RUN_DEFAULTS, RUN_LIMITS, migrateRunSettings, clampRunSettings, resolveRunOptions, scheduleRunDeadline, backgroundWindowActive, backgroundWindowEndAt, backgroundWindowLaunch } from './lib/run-settings.mjs'
 import { AUTOMATION_DEFAULTS, AUTOMATION_LIMITS, clampAutomationSettings, dailyScheduleStatus, markDailyStarted, releaseDailyStart } from './lib/automation.mjs'
 import { COMPANION_DEFAULTS, clampCompanionSettings, companionPolicy, companionPrompt, nextChatterAt } from './lib/companion.mjs'
@@ -84,9 +84,11 @@ import {
   //    同一条评论能从 `bili_reply`（视频通道）和 `bili_reply_opus`（动态通道）两处回，
   //    两个键各记各的 ⇒ 谁都不认谁 ⇒ 同一个人收到两条。这两把改成按 rpid 认，不看是哪条通道记的。
   dupLookupVideoComment, dupLookupOpusComment,
+  keyBook, keyUp, dupHitToday,
 } from './lib/dup.mjs'
 // ✍️ 评论质量的**硬下限**（只判"有没有内容"，不判好不好）—— 2026-10-20 使用者要求「不能单纯为了哗众取宠」
-import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK } from './lib/comment.mjs'
+import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK, bookHookOf } from './lib/comment.mjs'
+import { callBookGate } from './lib/book-gate.mjs'
 // 🧠 口味本子：把自己发出去的评论和被赞数对上，算出哪种说话方式有人爱听 —— 2026-10-20 使用者要的
 import { tasteRemember, tasteApplyLikes, tasteStats, tasteDigest, tasteTop, tasteMirror, TASTE_MIN_N } from './lib/taste.mjs'
 // 🎓 自主学习：学到的先进待审队列，批准了才注入提示词 —— 2026-10-21 使用者第 2 条要求
@@ -503,6 +505,7 @@ export function apply(ctx, config) {
       case 'bili_dm_reply': return `给 ${String(arg.uid || '')} 回一条私信`
       case 'bili_reply': return `在 ${bv} 的评论下面接话`
       case 'bili_comment': return `在 ${bv} 下面留一句话`
+      case 'bili_book_comment': return `给 ${bv} 写带资源的书评（先过书源门）`
       case 'bili_reply_opus': return `在动态 ${String(arg.opus_id || '')} 下面接话`
       case 'bili_moment': return '发一条说说～'
       case 'bili_danmaku': return `看 ${bv} 的弹幕`
@@ -1120,7 +1123,7 @@ export function apply(ctx, config) {
   const browsingTools = new Set(['bili_search', 'bili_subtitle', 'bili_danmaku', 'bili_buzzwords',
     'bili_video_info', 'bili_rank', 'bili_hot_videos', 'bili_user_videos', 'bili_comments',
     'bili_received_replies', 'bili_my_notices', 'bili_my_dynamics', 'bili_opus_comments',
-    'bili_my_video_comments', 'bili_reply', 'bili_comment', 'bili_reply_opus', 'bili_dm_inbox',
+    'bili_my_video_comments', 'bili_reply', 'bili_comment', 'bili_book_comment', 'bili_reply_opus', 'bili_dm_inbox',
     'bili_dm_thread', 'bili_dm_reply', 'bili_moment', 'bili_deliver'])
   const tool = (spec) => {
     const wrapped = {
@@ -1156,6 +1159,14 @@ export function apply(ctx, config) {
       try {
         const v = safe(await toolExecution.run(exec || {}, async () => {
           exec?.signal?.throwIfAborted()
+          /* 🐋 书评线「发送前组合」（规格 §5.3）：gate + 注入在入预览队列**之前**完成——
+           *    预览里躺着的就是将发送的最终全文（含链接，只有本人在待审核区看得到）。
+           *    组合阶段自己给出结果（gate-miss / hook-over / 判重…）时不入队、不执行；
+           *    批准重放时 approvedReviewArgs 已认得这份 args ⇒ 不再 gate/注入，直接走发送链。 */
+          const composed = spec.name === 'bili_book_comment' && !approvedReviewArgs.has(args)
+            ? await composeBookComment(args, exec)
+            : null
+          if (composed) return composed
           const review = await queueSendReview(spec.name, args, exec)
           if (review) return review
           return spec.execute(args, exec)
@@ -2517,7 +2528,7 @@ export function apply(ctx, config) {
     /* `presetRpid` 是 `bili_comment` 用的：传 '0' 就锁定"发新评论"这条分支。
        ⚠️ 必须复用**同一个 args 对象**（不要 `{...args}`）—— 审批路径靠 `approvedReviewArgs` 这个
        WeakMap 认身份，复制一份就等于把"预览时那张图的字节指纹"丢了。 */
-    async execute(args, exec, presetRpid) {
+    async execute(args, exec, presetRpid, opts = {}) {
       const bvid = String(args.bvid ?? '').trim()
       const rpid = presetRpid === undefined ? optionalId(args.rpid) : String(presetRpid)
       const isReply = rpid !== '0'
@@ -2612,8 +2623,10 @@ export function apply(ctx, config) {
        * 好不好代码判不出来，但「有没有内容」判得出来 —— 剔掉「awsl/太强了/哈哈哈」这类口号之后
        * 剩下的有内容的字太少，那它就是为了发而发。这种在工具层直接打回（force 时放行）。
        * ⚠️ 回复别人的评论门槛更低（kind:'reply'）：接话本来就该短。 */
+      const bookReview = opts?.bookReview === true
+      let officialWarn = []
       if (!args.force) {
-        const q = commentQuality(String(args.text ?? ''), { kind: isReply ? 'reply' : 'comment' })
+        const q = commentQuality(String(args.text ?? ''), { kind: isReply ? 'reply' : 'comment', bookReview })
         if (!q.ok) {
           return {
             ok: false, blocked: true, shallow: true,
@@ -2621,12 +2634,22 @@ export function apply(ctx, config) {
             hint: q.hint,
           }
         }
+        /* 🐋 书评模式（规格 §8.2 唯一放宽面）：官腔闸降级 warn —— 词表/阈值不动，
+         *    命中词在这里留痕（act note + 发送回执 qualityWarn），不拦发送。 */
+        officialWarn = Array.isArray(q.warnings) ? q.warnings : []
+        if (officialWarn.length) act('note', '书评官腔词命中（降级 warn，不拦）：' + officialWarn.join('；'))
         /* 🪞 去模板化（2026-10-21 v26）：内容过了，再看"是不是又长成同一个模子"。
          *   ⚠️ 只查**新评论**：回复是接别人的话，本来就短、本来就带口头禅，拿这个拦会把人逼成闷葫芦。
          *   ⚠️ 历史来自口味本子（最近 3 条自己的新评论），不够 3 条时这条规则自动失效 —— 不猜。 */
         if (!isReply) {
           try {
-            const t = templateCheck(String(args.text ?? ''), recentTexts(tasteLedger(), TEMPLATE_STREAK))
+            /* 🐋 书评判重口径（规格 §8.2「只比钩子」）：探针与历史都先剔除口令块（自第一个链接起）——
+             *    共享块会虚增/稀释相似度，重复钩子漏检。非书评路径逐字不变。 */
+            const templateHistory = recentTexts(tasteLedger(), TEMPLATE_STREAK)
+            const t = templateCheck(
+              bookReview ? bookHookOf(String(args.text ?? '')) : String(args.text ?? ''),
+              bookReview ? templateHistory.map(bookHookOf) : templateHistory,
+            )
             if (!t.ok) {
               return {
                 ok: false, blocked: true, shallow: true, template: true, rule: t.rule,
@@ -2787,7 +2810,12 @@ export function apply(ctx, config) {
       }
       /* 被风控了就把"歇多久"捎回去 —— 模型看得见这句才不会下一轮又去试。
          ⚠️ 只多挂一个 riskNote，别覆盖 MCP 原来的字段（success/rpid/error 那些下游还要用）。 */
-      if (riskNote && out && typeof out === 'object') return { ...out, riskNote }
+      if ((riskNote || officialWarn.length) && out && typeof out === 'object') {
+        const extra = {}
+        if (riskNote) extra.riskNote = riskNote
+        if (officialWarn.length) extra.qualityWarn = officialWarn
+        return { ...out, ...extra }
+      }
       return out
     },
   }
@@ -2822,6 +2850,168 @@ export function apply(ctx, config) {
       // 质量/判重/节奏/审核/风控闸全都是同一套，不另起一条会跑偏的路。
       // ⚠️ 传**原对象**（不是副本）：审批路径用 `approvedReviewArgs` WeakMap 认身份。
       return replyTool.execute(args, undefined, '0')
+    },
+  })
+
+  /* ── 🐋 鲸鱼书评「发送前组合」（规格 docs/spec-whale-bili-book-comment.md §5.2/§5.3/§8）──
+   * bili_book_comment = gate → 注入 → 现有发送链。发送链与 bili_comment 同一条薄壳
+   * （replyTool.execute），授权/审核/质量/判重/节奏/风控/占坑全部照旧；差别全在宿主这层：
+   *   ① 组合在 queueSendReview **之前**：hook 预检 → 判重预检（nu:/up:，uid 取不到 fail-closed）
+   *      → 书源门（claim 在服务器固定脚本内）→ text = hook + 换行 + block ≤150。
+   *      预览里躺着的就是将发送的最终全文（含链接，只有本人在待审核区看得到）。
+   *   ② 模型永远看不见块：组合结果只写进 args.text（发送链用），工具返回只带
+   *      found/source/bookId/block_len/hook_used/hook_left/sent/rpid（§5.2 步骤 7）。
+   *   ③ miss 不写任何判重键 ⇒ 该视频将来可再试；book:/up: 只在发送成功后写（§8.3）。
+   * 批准路径（sendReview）不再 gate/注入：approvedReviewArgs 认 args 身份，直接走发送链。 */
+  const bookComposedArgs = new WeakMap()
+  const GATE_FAIL_HINTS = {
+    'gate-unauthorized': '书源门凭证失效（gate-unauthorized）——不评论、本轮不重试，报给本人处理。',
+    'gate-timeout': '书源门超时（gate-timeout）——不评论、本轮不重试（fail-closed，§6.1）。',
+    'gate-error': '书源门出错（gate-error）——不评论、本轮不重试。',
+    'claim-failed': '建链/claim 失败（claim-failed）——不评论、不换候选再 claim。',
+    'claim-timeout': 'claim 超时（claim-timeout）——绝不重发，等台账回写兜底。',
+    'claim-orphan-suspect': '疑似孤儿分享（claim-orphan-suspect）——不评论，转人工核对。',
+    'render-error': '口令块渲染异常（render-error）——不发、不重试，这是实现缺陷信号。',
+  }
+  const composeBookComment = async (args, exec) => {
+    const blocked = (extra) => ({ ok: false, blocked: true, tool: 'bili_book_comment', ...extra })
+    /* ⓪ 授权面：与 bili_comment 共用「自动评论视频」开关。开关没开就不跑书源门——
+     *    gate 在网盘分支会触发不可逆的 claim，未授权时连只读台账查询也不空跑。 */
+    if (cfg.dmMode === 'only' || !cfg.autoComment) {
+      return blocked({ hint: '工作台 → 互动与投递中的「自动评论视频」未开启 —— 书评与普通评论共用这个开关；未开启时不跑书源门、不发送。' })
+    }
+    /* ① 本地预检（§5.2 入参契约）：bvid / 书名 / hook ≤90 字，超了直接回，不跑 gate。 */
+    const bvid = String(args.bvid ?? '').trim()
+    const title = String(args.title ?? '').trim()
+    const hook = String(args.hook ?? '').trim()
+    const hookLen = Array.from(hook).length
+    if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) {
+      return blocked({ code: 'hook-invalid', hook_used: hookLen, hint: 'bvid 必须是 BV + 10 位字母数字（拿到「' + bvid.slice(0, 40) + '」）。' })
+    }
+    if (!title) return blocked({ code: 'hook-invalid', hook_used: hookLen, hint: 'title（书名）不能为空 —— 书源门按书名找资源。' })
+    if (!hook) return blocked({ code: 'hook-invalid', hook_used: 0, hook_left: 90, hint: 'hook 不能为空：先写 ≤90 字的钩子，落「这个视频里的具体一下」，不含链接/提取码。' })
+    if (hookLen > 90) return blocked({ code: 'hook-invalid', hook_used: hookLen, hint: 'hook ' + hookLen + ' 字，超出 90 字预算 ' + (hookLen - 90) + ' 字 —— 删到 90 字以内再调（同轮最多重写 1 次）。' })
+    /* ② 发送前判重（省 claim）：同视频一条（nu:，§8.3 保留）；同 UP 每日一条（up:）。
+     *    uid 由宿主用 bili_video_info 取，取不到 ⇒ fail-closed 不发送并留痕（§8.3）。 */
+    const bvHit = dupLookup(repliedCommentsMap(), keyNewComment(bvid))
+    if (bvHit.hit) {
+      return blocked({ code: 'already-replied', hint: '这个视频（' + bvid + '）已经发过评论' + (bvHit.at ? '（' + bvHit.at + '）' : '') + ' —— 同一条视频只发一条，换下一条讲书视频。' })
+    }
+    let upUid = ''
+    try {
+      const videoInfo = await call('bili_video_info', { bvid })
+      upUid = readableId(videoInfo?.owner?.mid, { allowZero: false })
+    } catch { upUid = '' }
+    if (!upUid) return blocked({ code: 'uid-missing', hint: 'bili_video_info 没取到 UP 主 uid —— fail-closed 不发送（§8.3），本轮换一条视频。' })
+    const upHit = dupLookup(repliedCommentsMap(), keyUp(upUid))
+    if (upHit.hit && dupHitToday(upHit.at)) {
+      return blocked({ code: 'dup-up', hint: '这个 UP（' + upUid + '）今天已经发过一条' + (upHit.at ? '（' + upHit.at + '）' : '') + ' —— 同 UP 每日 ≤1，换别家的讲书视频。' })
+    }
+    /* ③ 书源门：台账优先 → 零命中才网盘作业 → 高置信才 claim → 回传口令块（不含链接文本）。 */
+    exec?.signal?.throwIfAborted()
+    const gate = await callBookGate(
+      { title, subtitle: '', author: '', aliases: [title] },
+      { pythonPath: cfg.pythonPath || 'python3', clientScript: join(pluginDir, 'vendor', 'book-gate', 'client.py') },
+    )
+    if (!gate.ok || !gate.found) {
+      const code = !gate.ok && gate.code ? String(gate.code) : 'gate-miss'
+      return blocked({
+        code,
+        ...(gate.detail ? { detail: String(gate.detail) } : {}),
+        hint: code === 'gate-miss'
+          ? '「' + title + '」没有可用资源（gate-miss）—— 不发送、不记账；换一条视频或换一本书，别换关键词反复试同一本。'
+          : GATE_FAIL_HINTS[code] || '书源门未知结果 —— 不评论、本轮不重试（fail-closed）。',
+      })
+    }
+    const bookId = String(gate.bookId ?? '')
+    const block = String(gate.block ?? '')
+    const blockLen = Array.from(block).length
+    const bookHit = dupLookup(repliedCommentsMap(), keyBook(bookId))
+    if (bookHit.hit && dupHitToday(bookHit.at)) {
+      return blocked({ code: 'dup-book', hint: '这本书（' + bookId + '）今天已经发过一条' + (bookHit.at ? '（' + bookHit.at + '）' : '') + ' —— 同书每日 ≤1，换一本活跃书。' })
+    }
+    /* ④ 注入：text = hook + 换行 + block，硬上限 150（§5.2 步骤 4：超预算回精确剩余字数，允许重写 1 次；
+     *    不截断、不降级成裸口令块）。 */
+    const text = hook + '\n' + block
+    const textLen = Array.from(text).length
+    if (textLen > 150) {
+      return blocked({ code: 'hook-over', hook_used: hookLen, hook_left: 90, block_len: blockLen, hint: '全文 ' + textLen + ' 字，超 150 上限 ' + (textLen - 150) + ' 字 —— 把 hook 删到 ' + Math.max(0, hookLen - (textLen - 150)) + ' 字以内再调一次（同轮最多重写 1 次，不截断、不降级）。' })
+    }
+    /* ⑤ 写进**同一个 args 对象**（审批路径靠对象身份免重跑，§5.3），元数据留给执行层记账。 */
+    args.text = text
+    args.bookId = bookId
+    args.gateSource = String(gate.source ?? '')
+    args.blockLen = String(blockLen)
+    args.upUid = upUid
+    bookComposedArgs.set(args, { bookId, source: String(gate.source ?? ''), blockLen, upUid, hookUsed: hookLen })
+    return null
+  }
+
+  /* 🐋 发带资源的书评（鲸鱼书评线，规格 §5.2）——模型只写钩子，书源门与口令块注入是宿主的活：
+   *    宿主先跑 gate（台账优先，必要时网盘作业 + 高置信 claim）→ 有资源才把块注入到钩子后面
+   *    → 与 bili_comment 同一条发送链（授权/审核/质量/判重/节奏/风控/占坑照旧，官腔闸降 warn，
+   *    模板判重只比钩子）。模型永远看不见链接与提取码：它们只存在于本工具的 args.text（预览与发送链）。 */
+  tool({
+    name: 'bili_book_comment',
+    description: '🐋 **发一条带网盘资源的书评**（讲书视频专用）：你负责挑讲书视频、读字幕确认、写 ≤90 字的钩子（hook，落「这个视频具体哪一下」，**不含链接/提取码**）；宿主先跑书源门——有资源才把口令块注入到钩子后面发出去，没资源就不发。\n'
+      + '什么时候用：确认这条视频真的在讲某本活跃书（书单看 LiveBrief 的【今日书单】行），读完字幕再调；行为边界全文见「先读章程、再读 prompts/book-review.md」。\n'
+      + '返回 found / source / bookId / block_len / hook_used / hook_left / sent / rpid / 失败码：gate-miss（无资源，不发不记账，换目标）、hook-over / hook-invalid（按提示重写，同轮最多 1 次）、dup-book / dup-up / already-replied（同书/同 UP/同视频已发，换目标）、gate-* / claim-*（本轮不重试，fail-closed）。\n'
+      + '🔴 text 由宿主组合注入——**永远不要自己写链接、提取码或 text 参数**；同一条视频/同一本书/同一个 UP 每日各只发一条（宿主记账并拦）。\n'
+      + '🔴 安全闸：与 bili_comment 共用「自动评论视频」开关（默认关）——关着时这只工具连书源门都不跑；不能用 force 绕过。',
+    parameters: {
+      bvid: { type: 'string', description: 'BV号（讲书视频）' },
+      title: { type: 'string', description: '书名（可含副标题；书源门自己做归一化变体）' },
+      hook: { type: 'string', description: '评论钩子：≤90 字、不含链接/提取码，落「这个视频里的具体一下」；全文 = hook + 口令块 ≤150' },
+      picture: { type: 'string', description: '（可选）表情图名字，最多 2 张；sendReview 开着时宿主会补 picture:"" 只发文字' },
+      text: { type: 'string', description: '（宿主注入，勿填）发送前组合阶段写入的最终全文 = hook + 口令块' },
+      bookId: { type: 'string', description: '（宿主注入，勿填）书源门命中的书 id，发送成功后记账用' },
+      gateSource: { type: 'string', description: '（宿主注入，勿填）书源门命中来源（ledger/netdisk）' },
+      blockLen: { type: 'string', description: '（宿主注入，勿填）口令块字数' },
+      upUid: { type: 'string', description: '（宿主注入，勿填）UP 主 uid，发送成功后记账用' },
+    },
+    async execute(args, exec) {
+      const approved = approvedReviewArgs.get(args)
+      const info = approved
+        ? {
+            bookId: String(args.bookId ?? ''),
+            source: String(args.gateSource ?? ''),
+            blockLen: Number(args.blockLen) || 0,
+            upUid: String(args.upUid ?? ''),
+            hookUsed: Array.from(String(args.hook ?? '').trim()).length,
+          }
+        : bookComposedArgs.get(args)
+      if (!info) {
+        return { ok: false, blocked: true, tool: 'bili_book_comment', code: 'gate-error', hint: '书评组合阶段没有先运行 —— 直接调 bili_book_comment({bvid,title,hook}) 让宿主先走书源门与注入，不要手工构造参数。' }
+      }
+      /* 发送链与 bili_comment 同一条薄壳：质量闸（书评官腔降 warn）、模板判重（只比钩子）、
+       * 判重 nu:、pace、风控、Python 占坑全在 replyTool.execute 里照旧跑。 */
+      const out = await replyTool.execute(args, exec, '0', { bookReview: true })
+      /* 📇 发送成功才记账 book:/up:（§8.3 只发成功后写，不预占）；nu:/taste/seen 由发送链自己写。 */
+      if (sendOk(out)) {
+        const rpid = readableId(out.rpid_str ?? out.rpid ?? '0')
+        const at = new Date().toISOString()
+        await withStateLock(() => {
+          const st = readJson(dutyStateFile, {})
+          const rec = { bvid: String(args.bvid ?? ''), rpid, at }
+          if (info.bookId) st.repliedComments = dupRemember(st.repliedComments, keyBook(info.bookId), { ...rec, bookId: info.bookId })
+          if (info.upUid) st.repliedComments = dupRemember(st.repliedComments, keyUp(info.upUid), { ...rec, uid: info.upUid })
+          writeJson(dutyStateFile, st)
+        })
+      }
+      /* 模型可见面（§5.2 步骤 7）：有没有、几字、发没发 —— 永远没有 block/链接字段。 */
+      return {
+        ...(out && typeof out === 'object' ? out : { raw: out }),
+        book_comment: {
+          found: true,
+          source: info.source || '',
+          bookId: info.bookId || '',
+          block_len: info.blockLen || 0,
+          hook_used: info.hookUsed,
+          hook_left: Math.max(0, 90 - info.hookUsed),
+          sent: sendOk(out),
+          rpid: readableId(out?.rpid_str ?? out?.rpid ?? '0'),
+        },
+      }
     },
   })
 
@@ -3186,7 +3376,7 @@ export function apply(ctx, config) {
    * `sendReview` 只对鱼模式的自动发送生效。默认关闭，旧发送语义不变。
    * 队列落在 state.json，重启后仍能看到待处理内容；批准时重新走原工具，
    * 进程内 WeakMap 只通过预览排队这一层，原开关、质量、判重、节奏和风控闸都不跳过。 */
-  const SEND_REVIEW_TOOLS = new Set(['bili_reply', 'bili_comment', 'bili_reply_opus', 'bili_dm_reply', 'bili_moment', 'bili_deliver'])
+  const SEND_REVIEW_TOOLS = new Set(['bili_reply', 'bili_comment', 'bili_book_comment', 'bili_reply_opus', 'bili_dm_reply', 'bili_moment', 'bili_deliver'])
   const SEND_REVIEW_MAX = 80
   const approvedReviewArgs = new WeakMap()
   const approvedReviewExecutions = new WeakMap()
@@ -3195,6 +3385,7 @@ export function apply(ctx, config) {
     if (toolName === 'bili_dm_reply') return '私信'
     if (toolName === 'bili_deliver') return '成果私信'
     if (toolName === 'bili_moment') return '动态'
+    if (toolName === 'bili_book_comment') return '书评'
     if (toolName === 'bili_reply_opus') return String(args.rpid || '0') === '0' ? '动态评论' : '动态回复'
     return String(args.rpid || '0') === '0' ? '视频评论' : '视频回复'
   }
@@ -3245,8 +3436,9 @@ export function apply(ctx, config) {
     try { clean = validateToolArguments(toolInputSchema(backgroundToolRegistry.get(toolName)?.parameters || {}), reviewArgs(args)) }
     catch (error) { return { ok: false, blocked: true, error: String(error?.message ?? error) } }
     if (JSON.stringify(clean).length > 16000) return { ok: false, blocked: true, error: '预览参数过长，未保存内容' }
-    // `bili_comment` 是 `bili_reply` 的"只发新评论"通道，picture 语义完全一致，一起走这段
-    const pictureTool = toolName === 'bili_reply' || toolName === 'bili_comment'
+    // `bili_comment` / `bili_book_comment` 都是 `bili_reply` 的"只发新评论"通道，picture 语义完全一致，一起走这段
+    // （书评线 sendReview 期间补 picture:"" ⇒ 自动配图失效，规格 §9.3）
+    const pictureTool = toolName === 'bili_reply' || toolName === 'bili_comment' || toolName === 'bili_book_comment'
     if (pictureTool && !Object.hasOwn(clean, 'picture')) clean.picture = ''
     const now = Date.now()
     const id = reviewIdOf(toolName, clean, now)
@@ -3982,6 +4174,11 @@ export function apply(ctx, config) {
   // 🐾 2026-10-26 桌宠化改造：签名加 opts —— 桌宠那条 /pet/start 会把「这一轮的 token 预算」
   //    递进来（headless 子进程没有鲸鱼摸鱼那套 token 保险丝，预算只能写进提示词让模型自己见好就收）。
   //    现有调用者不传参（opts.tokenBudget 为空 ⇒ 一行都不多），行为与从前完全一致。
+  /* 🐋 书评线实时书单（规格 §5.5）：读 DUTY/book-focus.json 拼一行；文件缺失/没书 ⇒ 整行不出现。
+   *    不进配置键、不进冻住的 objective —— 书单由仓内脚本另行生成，宿主只负责照着念。 */
+  const bookFocusLine = () => {
+    try { return bookFocusBrief(readJson(join(stateDir, 'book-focus.json'), null)) || '' } catch { return '' }
+  }
   const promptFor = (opts = {}) => {
     const duty = charterPath(pluginDir, stateDir)
     const soul = soulInject(stateDir, { budget: SOUL_INJECT_BUDGET })
@@ -3999,8 +4196,9 @@ export function apply(ctx, config) {
           ? `本次是时段任务：要一直刷到 ${new Date(opts.windowEndAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}（还剩约 ${Math.max(1, Math.round((opts.windowEndAt - Date.now()) / 60_000))} 分钟），`
           : Number(opts.durationMinutes) > 0 ? `本次计划刷约 ${opts.durationMinutes} 分钟，` : '本轮刷到节奏账本建议收工为止，')
         + '做完一轮（找片 → 读字幕 → 挑着互动 → 记一句）就接着开下一轮，中间按节奏闸自然休息；时间没到就继续找新视频、翻评论区、整理待审材料，别提前收工。先读章程 ' + duty + '。',
-      buildLiveBrief({ cfg, day: dayKey(), picked: countPickedToday(), moments: countMomentsToday(), outDir, digestDir, recentOpenings: recentMomentOpenings() }),
+      buildLiveBrief({ cfg, day: dayKey(), picked: countPickedToday(), moments: countMomentsToday(), outDir, digestDir, recentOpenings: recentMomentOpenings(), bookFocus: bookFocusLine() }),
       '按自己的兴趣找近7天的新视频，读字幕原文后判断；没找到合适的可以空手。可爱、吐槽和闲话都行，不靠固定自称、颜文字或关键词证明人格。',
+      '书评线：后台发带资源的新评论只用 bili_book_comment —— 你写 ≤90 字钩子（hook），书源门与口令块注入由宿主完成，链接/提取码永远不经你的手；动手前先读 ' + join(pluginDir, 'prompts', 'book-review.md') + '，今日书单看 LiveBrief 的【今日书单】行（没有就照常随机刷，不发书评）。',
       '开关只代表允许：不要求每挑一条就评、不要求发动态、不要求每轮学习或写心情。发送未知是否成功不能重发；收到节奏或冷却拒绝就换只读的事做。',
       '本进程通过宿主工具桥调用同一套鲸鱼摸鱼工具，以实际注册说明为准：bili_buzzwords 看热词，bili_seen 查刷过的片，bili_say 留选片旁白；bili_learn 只收集待审材料，不能自行批准；bili_soul 只记真实互动感受。发送前问 bili_pace，评论用 bili_reply / bili_reply_opus，私信开着时用 bili_dm_inbox / bili_dm_reply。共享开关、判重与节奏账本，未授权工具不可用。',
       '回复开着时先看看自己投稿下的评论，再看收到的回复；私信开着才翻收件箱，想接谁就接谁，不清空通知也不算欠账。ID按十进制字符串原样传。',
@@ -4352,6 +4550,10 @@ export function apply(ctx, config) {
       signal.throwIfAborted()
       refreshCfg()
       if (!mcpWhitelist().includes(name)) throw new Error('BACKGROUND_TOOL_DISABLED: 该动作的自动化开关已关闭')
+      // 🐋 §5.4 机器保证（后台）：bili_reply 只许带 rpid 回楼层 —— 后台没有"发新评论"的通道，
+      //    唯一新评论入口是 bili_book_comment（书源门 + 宿主注入）。放在白名单检查之后：
+      //    开关关着时报 DISABLED（既有语义不变），开关开着但没带 rpid 也拦下（fail-closed）。
+      if (name === 'bili_reply' && optionalId(args.rpid ?? '0') === '0') throw new Error('BACKGROUND_TOOL_DISABLED: 后台不发新评论 —— bili_reply 只许回楼层（带 rpid），发新评论走 bili_book_comment')
       const execution = { signal }
       backgroundExecutions.add(execution)
       try { return await backgroundToolRegistry.get(name).execute(args, execution) }
@@ -5246,6 +5448,7 @@ export function apply(ctx, config) {
   const feiyuObjective = () => buildFeiyuObjective({
     cfg, stateDir, outDir, digestDir,
     charter: charterPath(pluginDir, stateDir), day: dayKey(),
+    bookReviewGuide: join(pluginDir, 'prompts', 'book-review.md'),
   })
 
   /**
@@ -5808,7 +6011,7 @@ export function apply(ctx, config) {
           } catch { /* Learning is optional; it cannot break a conversation. */ }
           if (live && !live.stoppedAt && reallyRunning) {
             parts.push(buildLiveBrief({
-              cfg, day: dayKey(), picked: countPickedToday(), moments: countMomentsToday(), outDir, digestDir,
+              cfg, day: dayKey(), picked: countPickedToday(), moments: countMomentsToday(), outDir, digestDir, bookFocus: bookFocusLine(),
               recentOpenings: recentMomentOpenings(),
             }))
           }
