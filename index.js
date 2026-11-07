@@ -2931,12 +2931,20 @@ export function apply(ctx, config) {
     if (bvHit.hit) {
       return blocked({ code: 'already-replied', hint: '这个视频（' + bvid + '）已经发过评论' + (bvHit.at ? '（' + bvHit.at + '）' : '') + ' —— 同一条视频只发一条，换下一条讲书视频。' })
     }
+    /* uid 取不到的瞬间失败也要留证（上一轮真机两次 122ms 失败但错误被吞）⇒ 单次重试吸收抖动，错误进事件 detail */
     let upUid = ''
-    try {
-      const videoInfo = await call('bili_video_info', { bvid })
-      upUid = readableId(videoInfo?.owner?.mid, { allowZero: false })
-    } catch { upUid = '' }
-    if (!upUid) return blocked({ code: 'uid-missing', hint: 'bili_video_info 没取到 UP 主 uid —— fail-closed 不发送（§8.3），本轮换一条视频。' })
+    let uidErr = ''
+    for (let uidAttempt = 1; uidAttempt <= 2 && !upUid; uidAttempt++) {
+      try {
+        const videoInfo = await call('bili_video_info', { bvid })
+        upUid = readableId(videoInfo?.owner?.mid, { allowZero: false })
+        if (!upUid) uidErr = '回执缺 owner.mid（bvid=' + bvid + '）'
+      } catch (e) {
+        uidErr = String(e?.message ?? e).slice(0, 160)
+        if (uidAttempt === 1) await new Promise(r => setTimeout(r, 2000))
+      }
+    }
+    if (!upUid) return blocked({ code: 'uid-missing', detail: uidErr, hint: 'bili_video_info 没取到 UP 主 uid（' + uidErr + '）—— fail-closed 不发送（§8.3），本轮换一条视频。' })
     const upHit = dupLookup(repliedCommentsMap(), keyUp(upUid))
     if (upHit.hit && dupHitToday(upHit.at)) {
       return blocked({ code: 'dup-up', hint: '这个 UP（' + upUid + '）今天已经发过一条' + (upHit.at ? '（' + upHit.at + '）' : '') + ' —— 同 UP 每日 ≤1，换别家的讲书视频。' })
