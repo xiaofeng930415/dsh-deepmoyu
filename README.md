@@ -219,8 +219,7 @@ docs/ / marketplace/      部署、隐私、发布记录及市场条目
   -352/-412/-509/-799、连续 3 次非 pace 发送失败、send-unknown）停 24h、L2（DOM 核验 1 条 hidden）停 3 天、
   L3（hidden ≥2 或 ≥已发 20%、同书/同 UP 二次 hidden）停 7 天；触发即写 ledger 并停批次（后台终止子进程、
   会话暂停 goal）。已有未清除的停损期间，新一轮直接拒绝开跑。
-  ⚠️ **L2/L3 的判据已实现，但生产者（V2 DOM 抽样）属 T5c/T7**：当前 `v2_dom` 槽没有写入方，
-  所以这两档在 T7 接线前不会被触发——这是实现边界，不是缺陷。
+  L2/L3 的信号来自 V2 DOM 抽样（v2_dom 槽），生产者见下一节（T5c/T7，2026-11-08 接线）。
 - **降速 1 条/天**（不停跑）：连续 2 次 send-unknown 或最近 2 条已发的 V1 全判 miss/invisible。
   接口 miss 只当「待复核」，不单独判不可见（§9.5）。
 - **人工动作走文件**（模型无权改）：`<DSH_HOME>/bili-duty/whale-bounds.json`（默认 `~/.dsh`，DSH_HOME 可改）
@@ -235,3 +234,24 @@ docs/ / marketplace/      部署、隐私、发布记录及市场条目
 - **留痕**：`events[]` 追加 `skipped:daily-cap`、`skipped:stop-loss`、`stop-loss:L0..L3`、`stop-cleared`、
   `speed-down`、`speed-restored`、`recovery-ok`、`alert:no-hook`、`alert:tone-warn` 等；
   `/status` 的 `whaleBounds` 字段直接给出现读数（T7 真机验收核对用）。
+
+### V2 DOM 抽样核验（T5c/T7，2026-11-08）：生产者接线
+
+规格 §10.4 的权威可见性判据（接口只作辅助）。实现分两层，都在 `lib/whale-dom.mjs`：
+
+- **判定/调度（纯函数，可离线单测）**：`judgeDomResult` 把探针回包判成 `visible / hidden / unknown`；
+  `pickV2Targets` 决定这一轮核谁——① V1 判 miss/invisible 的行优先；② 否则每天随机 1 条（上限 3 条/天）。
+  已经核过的行（有 `v2_dom`）不重核；没真正发出的行不核。
+- **浏览器壳（`probeDom`）**：专用**临时** profile 的 headless Chrome（`mkdtemp` 的 user-data-dir，用完整个删掉），
+  cookie 从 `bili_credential.json` 注入 `SESSDATA / bili_jct / buvid3 / dedeuserid` 四个——
+  **绝不复用日常浏览器登录态**（与旧引流线 ego-browser 继承用户登录的做法隔离）。三步法：打开视频页 →
+  滚到 `#end`「没有更多评论」（证明完整加载）→ 穿 `bili-comments` shadow DOM 按 `data-user-profile-id`
+  认领并核对正文（钩子前 12 字）。
+  - 判据：完整加载 + 找到 = `visible`；完整加载 + 未找到 = `hidden`；未完整加载 / 页面打不开 / 没跑起来 = `unknown`。
+  - Chrome 路径：默认找 macOS Chrome/Chromium 常见位置，可用 `WHALE_CHROME_PATH` 指定。
+- **接线**：`sweepWhaleV1` 收尾（批起/批止 sweep）→ `whaleV2Check` 到期才真起浏览器 → 判完写
+  `posted[].v2_dom` + `events[] v2-dom:<status>` → **立刻 `whaleBoundsTick`**（`hidden` 是 L2/L3 的唯一信号，
+  写完不判 = 停不下来）。手动口：`POST /api/bili-duty/whale/v2`（body 可带 `{id}` 指定 ledger 行；
+  不带就按上面的触发口径挑）。`/status` 的 `whaleV2` 字段给出最近一条已核结果。
+- **实测（2026-11-08，T7）**：对首条真实书评（`BV1Mx476YEnf` / rpid `323305833488`）跑通，
+  13 秒出结论 `visible`（`dom:found`，正文含钩子前 12 字，threads=1、`#end`=「没有更多评论」）。

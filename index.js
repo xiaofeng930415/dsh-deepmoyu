@@ -89,7 +89,8 @@ import {
 // ✍️ 评论质量的**硬下限**（只判"有没有内容"，不判好不好）—— 2026-10-20 使用者要求「不能单纯为了哗众取宠」
 import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK, bookHookOf } from './lib/comment.mjs'
 import { callBookGate } from './lib/book-gate.mjs'
-import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile, withV1Result, withIngest, dueV1Checks, selectPendingIngest, withStop, withStopCleared, withRecovery, withRecoveryResult, withSpeed, withSpeedCleared, withSendOutcome } from './lib/whale-ledger.mjs'
+import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile, withV1Result, withIngest, dueV1Checks, selectPendingIngest, withStop, withStopCleared, withRecovery, withRecoveryResult, withSpeed, withSpeedCleared, withSendOutcome, withDomResult } from './lib/whale-ledger.mjs'
+import { probeDom, judgeDomResult, pickV2Targets } from './lib/whale-dom.mjs'
 import { readBounds, boundsFileOf, firstReviewOpen, dailyCapState, stopState, stopUntilOf, evaluateStop, evaluateSpeed, evaluateAlerts, recoveryVerdict } from './lib/whale-bounds.mjs'
 // 🐋 鲸鱼书评线 V1 核验（§10.3）与入库上报（§10.2，vendor 逐字副本 push.py 通道）
 import { sweepV1 } from './lib/whale-verify.mjs'
@@ -3903,8 +3904,55 @@ export function apply(ctx, config) {
     }).then(async (result) => {
       // V1 结果进账后立刻跑边界判定（降速/恢复档结算的数据源，§9.5）
       if (result?.checked) await whaleBoundsTick(null, 'v1')
+      // V2 DOM 抽样（§10.4）：V1 判 miss/invisible 优先核；每天再随机补 1 条。到期才真起浏览器。
+      void whaleV2Check('v1')
       return result
     }).catch((e) => { log('whale V1 核验失败（不致命）：' + String(e?.message ?? e)) })
+  }
+  /* ── 🐋 V2 DOM 抽样核验（规格 §10.4；T5c/T7 折入）────────────────────────
+   * 只对 ①V1 判 miss/invisible ②每天随机 1 条（上限 3 条/天）跑；专用临时 profile 的
+   * headless Chrome + bili_credential.json 注入四个 cookie → 三步法穿透 bili-comments shadow DOM。
+   * 判据全在 lib/whale-dom.mjs（纯函数，离线可测）；这里只接 IO、落账、跑边界判定：
+   * hidden 是 §9.5 L2/L3 的唯一信号 ⇒ 写完必须立刻 whaleBoundsTick，否则停不下来。 */
+  const whaleV2Check = async (trigger, opts = {}) => {
+    try {
+      const cred = loadCredential(stateDir)
+      if (!cred) return { ok: false, skipped: 'no-credential' }
+      const mid = readableId(cred.dedeuserid, { allowZero: false })
+      if (!mid) return { ok: false, skipped: 'no-mid' }
+      const ledger = whaleLedgerRead()
+      const rows = Array.isArray(ledger.posted) ? ledger.posted : []
+      let targets = []
+      if (opts.id) {
+        const row = rows.find((item) => String(item?.id ?? '') === String(opts.id))
+        if (!row) return { ok: false, skipped: 'no-row' }
+        targets = [{ id: String(row.id), bvid: String(row.bvid ?? ''), rpid: String(row.rpid ?? ''), reason: 'manual' }]
+      } else {
+        targets = pickV2Targets(ledger, { nowTs: Date.now() })
+      }
+      if (!targets.length) return { ok: true, checked: 0 }
+      const results = []
+      for (const target of targets) {
+        const row = rows.find((item) => String(item?.id ?? '') === target.id)
+        const hook = String(row?.hook ?? '')
+        let raw = { ok: false, error: 'ledger 行没有 bvid' }
+        if (/^BV[0-9A-Za-z]{10}$/.test(target.bvid)) {
+          raw = await probeDom({ bvid: target.bvid, rpid: target.rpid, mid, cred, log: (m) => log(m) })
+        }
+        const verdict = judgeDomResult(raw, { mid, hook })
+        await whaleLedgerWrite((l) => withDomResult(l, target.id, { ...verdict }))
+        await whaleLedgerEvent('v2-dom:' + verdict.status, (target.reason === 'v1-miss' ? 'V1 待复核' : target.reason === 'daily-sample' ? '每日随机抽样' : '手动触发')
+          + ' ' + target.bvid + (target.rpid ? ' rpid=' + target.rpid : '') + '：' + verdict.note, {})
+        results.push({ ...target, status: verdict.status, how: verdict.how, note: verdict.note })
+        log('whale V2（' + trigger + '）：' + target.bvid + ' → ' + verdict.status + '（' + verdict.how + '）')
+      }
+      // hidden 是 L2/L3 的唯一信号（§9.5）：账写完立刻判定，延迟一行都不行
+      await whaleBoundsTick(null, 'v2')
+      return { ok: true, checked: results.length, results }
+    } catch (e) {
+      log('whale V2 核验失败（不致命）：' + String(e?.message ?? e))
+      return { ok: false, error: String(e?.message ?? e) }
+    }
   }
   const pushWhalePending = (trigger) => {
     const run = async () => {
@@ -7247,6 +7295,16 @@ export function apply(ctx, config) {
           }
         } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
       })(),
+      /* 🧭 V2 DOM 抽样读数（§10.4；T5c/T7）：最近一条已核 + 累计核过几条，真机验收看它 */
+      whaleV2: (() => {
+        try {
+          const rows = (whaleLedgerRead().posted || []).filter((row) => row && row.v2_dom)
+          const last = rows.length ? rows[rows.length - 1] : null
+          return last
+            ? { bvid: String(last.bvid ?? ''), rpid: String(last.rpid ?? ''), status: String(last.v2_dom?.status ?? ''), how: String(last.v2_dom?.how ?? ''), at: String(last.v2_dom?.at ?? ''), checked: rows.length }
+            : { checked: 0 }
+        } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
+      })(),
       retrospective: sevenDayRetrospective(st),
       recovery: recoverySnapshot({ feiyu: feiyuNow, schedule: scheduleNow, state: st }),
       petShow: Boolean(cfg.petShow),
@@ -7814,6 +7872,18 @@ export function apply(ctx, config) {
 
     if (req.method === 'POST' && path === '/api/bili-duty/run') {
       return sendJson(res, 200, { ok: true, ...runDuty('manual') })
+    }
+
+    /* 🐋 V2 DOM 核验手动口（§10.4 的「人工 DOM 复核」与 T7 演练用）：body 可带 {id} 指定 ledger 行，
+     *    不带就按 §10.4 的触发口径自己挑（V1 待复核优先 → 每天随机 1 条；已核过的不重核）。
+     *    真要起浏览器，可能几十秒到两分钟，所以这里 await 完再回（调用方是诊断脚本/人工，不是高频路径）。 */
+    if (req.method === 'POST' && path === '/api/bili-duty/whale/v2') {
+      try {
+        const body = await readBody(req)
+        return sendJson(res, 200, await whaleV2Check('manual', { id: body?.id }))
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e?.message ?? e) })
+      }
     }
 
     /* 🐟 鲸鱼摸鱼模式：设置页那几个按钮
