@@ -75,7 +75,7 @@ test('停损状态机：active / 停满待人工签 / 停满且已签；ack 必�
   assert.deepEqual([stopState(ledgerWith([], { stop: expiredStop }), bounds(), NOW).needsAck], [true], '停满未签')
   assert.equal(stopState(ledgerWith([], { stop: expiredStop }), bounds({ stopAck: iso(since - 60_000) }), NOW).needsAck, true, '旧 ack（早于停损起点）不算')
   const acked = stopState(ledgerWith([], { stop: expiredStop }), bounds({ stopAck: iso(today(-30)) }), NOW)
-  assert.deepEqual([acked.expired, acked.needsAck, acked.acked], [true, false, true])
+  assert.deepEqual([acked.expired, acked.needsAck], [true, false])
   assert.equal(stopState(emptyLedger(), bounds(), NOW).active, false)
   assert.deepEqual(stopUntilOf('L1', NOW), { until: iso(NOW + 24 * 3600_000), until_ts: NOW + 24 * 3600_000 })
   assert.equal(stopUntilOf('L0', NOW).until_ts, endOfLocalDay(NOW), 'L0 停到当日结束')

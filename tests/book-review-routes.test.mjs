@@ -284,6 +284,18 @@ test('T6 bounds: first 3 sends force review even with sendReview off; daily cap 
     assert.equal(renderLedger.stop?.level, 'L0', 'render-error ⇒ L0 停当日：' + JSON.stringify(renderLedger.stop))
     assert.ok(renderLedger.events.some((e) => e.code === 'render-error'), 'render-error 事件留痕')
     assert.ok(renderLedger.events.some((e) => e.code === 'stop-loss:L0'), '停损落账留痕')
+    /* ⑧ fail-open（§10.1）：ledger 读写坏掉时，组合与发送都不得被它拦住
+     *    （把 ledger.json 换成目录 ⇒ readJson/写盘都失败） */
+    writeFileSync(join(home, 'state.json'), JSON.stringify({}))
+    writeFileSync(join(home, 'whale-bounds.json'), JSON.stringify({ phase: 'observation' }))
+    gateReply = null
+    rmSync(join(home, 'whale-book-comment'), { recursive: true, force: true })
+    mkdirSync(join(home, 'whale-book-comment', 'ledger.json'), { recursive: true })
+    const failOpen = await execute('bili_book_comment', { bvid: BV, title: '合成的书名', hook: HOOK })
+    assert.equal(failOpen.queued, true, 'ledger 故障不拦组合：' + JSON.stringify(failOpen))
+    const failOpenRow = (await request('/send-review')).body.items[0]
+    const failOpenSent = await request('/send-review', { id: failOpenRow.id, decision: 'approve', expectedHash: failOpenRow.hash })
+    assert.equal(failOpenSent.body.sent, true, 'ledger 写失败不把成功发送变成报错：' + JSON.stringify(failOpenSent.body))
   } finally {
     for (const fn of cleanups.reverse()) try { fn() } catch {}
     cp.spawn = originalSpawn; syncBuiltinESMExports(); McpClient.prototype.call = original

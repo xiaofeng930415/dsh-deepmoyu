@@ -90,7 +90,7 @@ import {
 import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK, bookHookOf } from './lib/comment.mjs'
 import { callBookGate } from './lib/book-gate.mjs'
 import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile, withV1Result, withIngest, dueV1Checks, selectPendingIngest, withStop, withStopCleared, withRecovery, withRecoveryResult, withSpeed, withSpeedCleared, withSendOutcome } from './lib/whale-ledger.mjs'
-import { emptyBounds, readBounds, boundsFileOf, firstReviewOpen, dailyCapState, stopState, stopUntilOf, evaluateStop, evaluateSpeed, evaluateAlerts, recoveryVerdict } from './lib/whale-bounds.mjs'
+import { readBounds, boundsFileOf, firstReviewOpen, dailyCapState, stopState, stopUntilOf, evaluateStop, evaluateSpeed, evaluateAlerts, recoveryVerdict } from './lib/whale-bounds.mjs'
 // 🐋 鲸鱼书评线 V1 核验（§10.3）与入库上报（§10.2，vendor 逐字副本 push.py 通道）
 import { sweepV1 } from './lib/whale-verify.mjs'
 import { ingestRows } from './lib/whale-push.mjs'
@@ -2907,10 +2907,26 @@ export function apply(ctx, config) {
    * 人工动作用文件表达（模型无权改）：升档/改上限写 phase/dailyCap；停损恢复写 stopAck；
    * 降速恢复写 speedAck —— 与 book-focus.json 同一个家目录口径。 */
   const whaleBoundsFile = () => boundsFileOf(stateDir)
-  const whaleBoundsRead = () => { try { return readBounds(stateDir) } catch { return emptyBounds() } }
+  const whaleBoundsRead = () => readBounds(stateDir)
   const whaleLedgerRead = () => { try { return readJson(whaleLedgerPath(), emptyLedger()) } catch { return emptyLedger() } }
   /** 首 3 条人工批准（§9.3）：已成功发送数 < 3 ⇒ 强制入预览队列 */
   const whaleForceReview = () => { try { return firstReviewOpen(whaleLedgerRead()) } catch { return false } }
+
+  /** 书评发送前判重（§8.3 的 nu:/book:/up: 三条）——组合路径与**批准路径**共用：
+   *  审批队列可能躺很久，期间同书/同 UP/同视频可能已经发出过一条，光靠组合时那次检查会漏。 */
+  const whaleDupAdmit = (args) => {
+    const map = repliedCommentsMap()
+    const bv = String(args?.bvid ?? '').trim()
+    const bookId = String(args?.bookId ?? '').trim()
+    const upUid = String(args?.upUid ?? '').trim()
+    const bvHit = bv ? dupLookup(map, keyNewComment(bv)) : null
+    if (bvHit?.hit) return { code: 'already-replied', hint: '这个视频（' + bv + '）已经发过评论 —— 同一条视频只发一条，换下一条讲书视频。' }
+    const bookHit = bookId ? dupLookup(map, keyBook(bookId)) : null
+    if (bookHit?.hit && dupHitToday(bookHit.at)) return { code: 'dup-book', hint: '这本书（' + bookId + '）今天已经发过一条 —— 同书每日 ≤1，换一本活跃书。' }
+    const upHit = upUid ? dupLookup(map, keyUp(upUid)) : null
+    if (upHit?.hit && dupHitToday(upHit.at)) return { code: 'dup-up', hint: '这个 UP（' + upUid + '）今天已经发过一条 —— 同 UP 每日 ≤1，换别家的讲书视频。' }
+    return null
+  }
 
   /** 停批次（§9.5：「写 ledger 并停批次」）：会话态暂停 goal；后台态终止 headless 子进程。 */
   const whaleStopBatch = (exec, reason) => {
@@ -2970,9 +2986,9 @@ export function apply(ctx, config) {
   const whaleStartGate = () => {
     const bounds = whaleBoundsRead()
     const state = stopState(whaleLedgerRead(), bounds, Date.now())
-    if (state.active) return { ok: false, error: '书评线停损中（' + state.level + '，到 ' + state.until + '）：停满后按规格 §9.5 人工核验，再把 whale-bounds.json 的 stopAck 写成当前时间才能恢复。' }
-    if (state.needsAck) return { ok: false, error: '书评线停损已停满（' + (state.level || 'L1') + '，' + String(state.record?.reason ?? '') + '），但还没有人工核验签字：核验后把 ~/.dsh/bili-duty/whale-bounds.json 的 stopAck 写成当前时间，再开这一轮（恢复首日只发 1 条）。' }
-    return { ok: true, recovery: state.acked === true }
+    if (state.active) return { ok: false, error: '书评线停损中（' + state.level + '，到 ' + state.until + '）：停满后按规格 §9.5 人工核验，再把 ' + whaleBoundsFile() + ' 的 stopAck 写成当前时间才能恢复。' }
+    if (state.needsAck) return { ok: false, error: '书评线停损已停满（' + (state.level || 'L1') + '，' + String(state.record?.reason ?? '') + '），但还没有人工核验签字：核验后把 ' + whaleBoundsFile() + ' 的 stopAck 写成当前时间，再开这一轮（恢复首日只发 1 条）。' }
+    return { ok: true }
   }
 
   const composeBookComment = async (args, exec) => {
@@ -2991,7 +3007,7 @@ export function apply(ctx, config) {
         const map = { 'hook-over': 'hook-over-budget' }
         await whaleLedgerEvent(map[code] || code, String(extra.hint ?? ''), { bvid, bookId: title })
         // no-hook 报警（§9.5）不经过发后 tick —— 纯 no-hook 的轮也要能在连续 3 次时报出来
-        if (code === 'no-hook') await whaleAlertsTick()
+        if (code === 'no-hook') { try { await whaleAlertsTick() } catch (e) { log('whale 报警评估失败（不致命）：' + String(e?.message ?? e)) } }
       }
       return { ok: false, blocked: true, tool: 'bili_book_comment', ...extra }
     }
@@ -3012,7 +3028,7 @@ export function apply(ctx, config) {
       return blocked({ hint: '书评线停损中（' + whStop.level + '，停到 ' + whStop.until + '）：这条不发（记 skipped:stop-loss）；停满后人工核验并写 stopAck 才恢复。' })
     }
     if (whStop.expired && whStop.needsAck) {
-      return blocked({ hint: '书评线停损已停满（' + whStop.level + '），但还没有人工核验签字 —— 核验后把 ~/.dsh/bili-duty/whale-bounds.json 的 stopAck 写成当前时间；恢复首日只发 1 条。' })
+      return blocked({ hint: '书评线停损已停满（' + whStop.level + '），但还没有人工核验签字 —— 核验后把 ' + whaleBoundsFile() + ' 的 stopAck 写成当前时间；恢复首日只发 1 条。' })
     }
     /* 停满且已人工核验 ⇒ 清停损、进恢复档（首日 1 条/天，§9.5）。 */
     if (whStop.expired && whStop.record && !whStop.needsAck) {
@@ -3183,7 +3199,8 @@ export function apply(ctx, config) {
       await whaleLedgerWrite((l) => withSendOutcome(l, { ok: wlSent, fail: wlFailedSend, unknown: wlEvent === 'send-unknown' }))
       const wlToneWarns = Array.isArray(out?.qualityWarn) ? out.qualityWarn.filter(Boolean) : []
       if (wlToneWarns.length) await whaleLedgerEvent('tone-warn', wlToneWarns.join('；'), { bvid: String(args.bvid ?? ''), bookId: info.bookId })
-      await whaleBoundsTick(exec, 'send')
+      // ⚠️ 边界判定是账务，不是发送链的闸：它自己出错绝不能把一次已成功的发送变成工具报错
+      try { await whaleBoundsTick(exec, 'send') } catch (e) { log('whale 边界判定失败（不致命）：' + String(e?.message ?? e)) }
       /* 📇 发送成功才记账 book:/up:（§8.3 只发成功后写，不预占）；nu:/taste/seen 由发送链自己写。 */
       if (sendOk(out)) {
         const rpid = readableId(out.rpid_str ?? out.rpid ?? '0')
@@ -3744,6 +3761,9 @@ export function apply(ctx, config) {
         if (stop.active || stop.needsAck) return { ok: false, error: '书评线停损中（' + String(stop.level || '') + '）：先按规格 §9.5 人工核验；门不放行时这条留在待审核。' }
         const cap = dailyCapState(ledger, bounds, Date.now())
         if (cap.reached) return { ok: false, error: '今天书评已到上限（' + cap.sent + '/' + cap.cap + ' 条）—— 这条留在待审核，明天再批。' }
+        // 排队期间同书/同 UP/同视频可能已经发过一条 ⇒ 批准时复检判重（§8.3）
+        const dup = whaleDupAdmit(row.args)
+        if (dup) return { ok: false, code: dup.code, error: dup.hint + '（这条留在待审核，建议拒绝掉）' }
       }
       target = { ...row, args: reviewArgs(row.args) }
       rows[index] = { ...row, state: decision === 'approve' ? 'approving' : 'rejected', updatedAt: new Date().toISOString(), decidedAt: new Date().toISOString() }
@@ -3751,7 +3771,11 @@ export function apply(ctx, config) {
       if (decision === 'approve') reviewSending.add(key)
       return { ok: true }
     })
-    if (!claimed?.ok) return claimed
+    if (!claimed?.ok) {
+      // 批准时复检判重命中也要留痕（§8.3/§10.1）
+      if (claimed.code === 'dup-book' || claimed.code === 'dup-up' || claimed.code === 'already-replied') await whaleLedgerEvent(claimed.code, '批准时复检判重命中：' + String(claimed.error ?? ''), {})
+      return claimed
+    }
     if (decision === 'reject') {
       act('note', `已拒绝${target.kind}预览`, { reviewId: key })
       if (target.tool === 'bili_book_comment') await whaleLedgerEvent('skipped:review-rejected', '预览被本人拒绝', { bvid: String(target.args?.bvid ?? ''), bookId: String(target.args?.bookId ?? '') })

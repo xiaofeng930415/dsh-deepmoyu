@@ -220,7 +220,7 @@ docs/ / marketplace/      部署、隐私、发布记录及市场条目
   所以这两档在 T7 接线前不会被触发——这是实现边界，不是缺陷。
 - **降速 1 条/天**（不停跑）：连续 2 次 send-unknown 或最近 2 条已发的 V1 全判 miss/invisible。
   接口 miss 只当「待复核」，不单独判不可见（§9.5）。
-- **人工动作走文件**（模型无权改）：`~/.dsh/bili-duty/whale-bounds.json`
+- **人工动作走文件**（模型无权改）：`<DSH_HOME>/bili-duty/whale-bounds.json`（默认 `~/.dsh`，DSH_HOME 可改）
   ```json
   { "phase": "observation", "dailyCap": null, "stopAck": "", "speedAck": "", "note": "" }
   ```
