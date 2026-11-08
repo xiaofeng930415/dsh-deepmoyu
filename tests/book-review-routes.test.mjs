@@ -174,3 +174,89 @@ test('book review reject keeps the claim result unused and sends nothing; permis
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('T6 bounds: first 3 sends force review even with sendReview off; daily cap and stop-loss block before the gate', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fish-book-bounds-')), home = join(dir, 'bili-duty')
+  mkdirSync(home)
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ sendReview: false, autoComment: true, replyToComments: false, autoReplyDm: false, autoMoment: false, learnAutoReview: false, reportLevel: 'off', pythonPath: 'synthetic-python' }))
+  writeFileSync(join(home, 'state.json'), JSON.stringify({}))
+  const cleanups = [], tools = new Map(), calls = [], spawns = []
+  const agent = { id: 'book-bounds-fish', session: { header: { agentPreset: 'dafeiyu', cwd: dir } },
+    ctx: { tools: { register(spec) { tools.set(spec.name, spec); return () => tools.delete(spec.name) } } } }
+  const original = McpClient.prototype.call
+  McpClient.prototype.call = async function(name, args) {
+    calls.push({ name, args })
+    if (name === 'bili_video_info') return { bvid: BV, title: '合成的讲书视频', owner: { mid: UID } }
+    if (name === 'bili_reply') return { success: true, rpid_str: SENT }
+    throw new Error('UNEXPECTED_MCP_CALL: ' + name)
+  }
+  const cp = createRequire(import.meta.url)('node:child_process'), originalSpawn = cp.spawn
+  cp.spawn = (command, args) => {
+    spawns.push({ command, args })
+    if (String(args?.[0] ?? '').endsWith('client.py')) {
+      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = () => true
+      queueMicrotask(() => { child.stdout.emit('data', Buffer.from(JSON.stringify(GATE_FOUND))); child.emit('close', 0) })
+      return child
+    }
+    throw new Error('UNEXPECTED_SUBPROCESS: ' + String(command))
+  }; syncBuiltinESMExports()
+  let handler
+  const ctx = { logger: { info() {} }, get: key => key === 'dshHomePath' ? (...parts) => join(dir, ...parts) : key === 'agents' ? { list: () => [agent] } : undefined,
+    tools: { register() { throw new Error('GLOBAL_TOOL_REGISTRATION_FORBIDDEN') } }, settings: { describe: () => [] }, on() { return () => {} },
+    effect(fn) { const cleanup = fn(); if (typeof cleanup === 'function') cleanups.push(cleanup) },
+    webServer: { register(route) { handler = route.handler; return { dispose() {} } } } }
+  const request = async (path, body, method = body === undefined ? 'GET' : 'POST', headers = {}) => {
+    const req = new EventEmitter(); req.url = '/api/bili-duty' + path; req.method = method; req.headers = headers; req.destroy = () => {}
+    const res = { writeHead(status) { this.status = status }, end(value) { this.body = Buffer.isBuffer(value) ? value : value ? JSON.parse(value) : {} } }
+    const promise = handler(req, res)
+    if (method === 'POST') { req.emit('data', Buffer.from(JSON.stringify(body))); req.emit('end') }
+    await promise; return res
+  }
+  const ledgerFile = join(home, 'whale-book-comment', 'ledger.json')
+  mkdirSync(join(home, 'whale-book-comment'), { recursive: true })
+  const writeLedger = (value) => writeFileSync(ledgerFile, JSON.stringify({ version: 1, posted: [], events: [], ...value }))
+  const readLedger = () => JSON.parse(readFileSync(ledgerFile, 'utf8'))
+  try {
+    apply(ctx, {}); await flush()
+    const execute = (name, args, exec = { agent }) => tools.get(name).execute(args, exec)
+    /* ① 首 3 条（§9.3）：sendReview 关着也必须人工批准 —— 强制进预览队列，不直发 */
+    const queued = await execute('bili_book_comment', { bvid: BV, title: '合成的书名', hook: HOOK })
+    assert.equal(queued.queued, true, JSON.stringify(queued))
+    assert.equal(queued.forced, true, '首 3 条 forced 标记')
+    assert.ok(!calls.some(row => row.name === 'bili_reply'), '未批准前一个字都不发')
+    assert.equal((await request('/send-review')).body.counts.pending, 1, '内容在预览队列里等本人点头')
+    /* ② 每日上限（§9.2）：预置今天 3 条已发 ⇒ 拒绝并记 skipped:daily-cap，连书源门都不跑 */
+    const now = Date.now()
+    writeLedger({ posted: [0, 1, 2].map((i) => ({ id: 'wl-cap-' + i, bvid: 'BV000000000' + i, sent: true, rpid: String(900 + i), posted_at: new Date(now - i * 60_000).toISOString(), posted_ts: now - i * 60_000 })) })
+    const before = spawns.length
+    const capped = await execute('bili_book_comment', { bvid: BV, title: '合成的书名', hook: HOOK })
+    assert.equal(capped.blocked, true, JSON.stringify(capped))
+    assert.match(String(capped.hint), /上限/)
+    assert.equal(spawns.length, before, '达限时不跑书源门（更不会 claim）')
+    assert.ok(readLedger().events.some(e => e.code === 'skipped:daily-cap'), '达限事件留痕')
+    /* ③ 停损（§9.5 L1）：未到期的停损 ⇒ 拒绝 + 事件 + 不跑书源门 */
+    const untilTs = now + 24 * 3600_000
+    writeLedger({ stop: { level: 'L1', reason: 'risk-code', since: new Date(now - 60_000).toISOString(), since_ts: now - 60_000, until: new Date(untilTs).toISOString(), until_ts: untilTs, cleared_at: '' } })
+    const stopped = await execute('bili_book_comment', { bvid: BV, title: '合成的书名', hook: HOOK })
+    assert.equal(stopped.blocked, true, JSON.stringify(stopped))
+    assert.match(String(stopped.hint), /停损/)
+    assert.equal(spawns.length, before, '停损时不跑书源门')
+    assert.ok(readLedger().events.some(e => e.code === 'skipped:stop-loss'), '停损事件留痕')
+    /* ④ 批起闸（§9.5 停批次）：停损未停满时，手动开后后台轮直接被拒（不 spawn） */
+    const started = await request('/pet/start', { mode: 'background' })
+    assert.equal(started.body.started, false, JSON.stringify(started.body))
+    assert.match(String(started.body.error), /停损/)
+    assert.equal(spawns.length, before, '停损时不 spawn 后台进程')
+    /* ⑤ /status 暴露边界读数（T7 真机验收靠它核对） */
+    const status = (await request('/status')).body
+    assert.equal(status.whaleBounds.stop.active, true)
+    assert.equal(status.whaleBounds.stop.level, 'L1')
+    assert.equal(status.whaleBounds.phase, 'observation')
+    assert.equal(status.whaleBounds.cap, 3)
+    assert.ok(status.whaleBounds.boundsFile.endsWith('whale-bounds.json'))
+  } finally {
+    for (const fn of cleanups.reverse()) try { fn() } catch {}
+    cp.spawn = originalSpawn; syncBuiltinESMExports(); McpClient.prototype.call = original
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

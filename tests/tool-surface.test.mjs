@@ -125,7 +125,7 @@ const sourceReply = name => {
   throw new Error('UNEXPECTED_DOWNSTREAM_TOOL: ' + name)
 }
 
-async function fixture(run, { permissions = false, worker = false, login = false, installer = false, gate = null } = {}) {
+async function fixture(run, { permissions = false, worker = false, login = false, installer = false, gate = null, whaleSent = 0 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'fish-tool-surface-')), home = join(root, 'bili-duty'), cleanups = [], tools = new Map(), events = new Map(), calls = [], subprocesses = [], fetches = [], goals = new Map()
   mkdirSync(home)
   const cli = join(root, 'synthetic-cli.js'); writeFileSync(cli, '// Never executed; child process is mocked.')
@@ -133,6 +133,22 @@ async function fixture(run, { permissions = false, worker = false, login = false
     backgroundModelId: 'surface/model', autoComment: permissions, replyToComments: permissions, autoReplyDm: permissions, autoMoment: permissions,
     momentPerDay: 3, dmReplyFollowedOnly: false, dmMode: permissions ? 'both' : 'off', dmUid: UID, sendReview: false, stickerAutoCollect: false, stickerAutoSend: false }))
   writeFileSync(join(home, 'bili_credential.json'), JSON.stringify({ sessdata: 'synthetic-session', bili_jct: 'synthetic-csrf' }))
+  // 🐋 T6：书评首 3 条强制人工批准（§9.3）——需要「已经发过 N 条」的夹具时预置 ledger，
+  //    让本用例继续验证共享发送链而不是预览队列。
+  if (whaleSent > 0) {
+    mkdirSync(join(home, 'whale-book-comment'), { recursive: true })
+    const now = Date.now()
+    // 种子行放在**昨天**：既让「首 3 条强制审核」已过（发过 3 条），又不占今天的每日上限。
+    const posted = Array.from({ length: whaleSent }, (_, i) => {
+      const ts = now - 26 * 3600_000 - i * 60_000
+      return {
+        id: 'wl-seed-' + i, bvid: 'BV00000000' + String(i).padStart(2, '0'), book_id: 'seed-book-' + i,
+        sent: true, rpid: String(1000 + i), guard_status: 'sent',
+        posted_at: new Date(ts).toISOString(), posted_ts: ts,
+      }
+    })
+    writeFileSync(join(home, 'whale-book-comment', 'ledger.json'), JSON.stringify({ version: 1, posted, events: [] }))
+  }
   const fish = { id: 'surface-fish', status: 'idle', session: { id: 'surface-fish', header: { agentPreset: 'dafeiyu', cwd: root } },
     ctx: { tools: { register(spec) { tools.set(spec.name, spec); return () => { if (tools.get(spec.name) === spec) tools.delete(spec.name) } } } }, cancel() {} }
   const normal = { id: 'surface-normal', session: { header: { agentPreset: 'standard', cwd: root } }, ctx: { tools: { register() { assert.fail('ordinary session cannot mount fish schemas') } } } }
@@ -336,7 +352,7 @@ test('bili_book_comment composes hook+block through the gate and sends through t
   assert.equal(st.repliedComments['book:synthetic-book'].bvid, BV)
   assert.ok(st.repliedComments['up:' + UID], 'up: key written after success')
   assert.equal(st.repliedComments['up:' + UID].uid, UID)
-}, { permissions: true, gate: GATE_FOUND }))
+}, { permissions: true, gate: GATE_FOUND, whaleSent: 3 }))
 
 test('bili_book_comment gate-miss sends nothing and writes no dedup key', async () => fixture(async f => {
   const out = await f.execute('bili_book_comment', { bvid: BV, title: '没资源的书', hook: HOOK })

@@ -89,7 +89,8 @@ import {
 // ✍️ 评论质量的**硬下限**（只判"有没有内容"，不判好不好）—— 2026-10-20 使用者要求「不能单纯为了哗众取宠」
 import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK, bookHookOf } from './lib/comment.mjs'
 import { callBookGate } from './lib/book-gate.mjs'
-import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile, withV1Result, withIngest, dueV1Checks, selectPendingIngest } from './lib/whale-ledger.mjs'
+import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile, withV1Result, withIngest, dueV1Checks, selectPendingIngest, withStop, withStopCleared, withRecovery, withRecoveryResult, withSpeed, withSpeedCleared, withSendOutcome } from './lib/whale-ledger.mjs'
+import { emptyBounds, readBounds, boundsFileOf, firstReviewOpen, dailyCapState, stopState, stopUntilOf, evaluateStop, evaluateSpeed, evaluateAlerts, recoveryVerdict } from './lib/whale-bounds.mjs'
 // 🐋 鲸鱼书评线 V1 核验（§10.3）与入库上报（§10.2，vendor 逐字副本 push.py 通道）
 import { sweepV1 } from './lib/whale-verify.mjs'
 import { ingestRows } from './lib/whale-push.mjs'
@@ -1171,7 +1172,7 @@ export function apply(ctx, config) {
             ? await composeBookComment(args, exec)
             : null
           if (composed) return composed
-          const review = await queueSendReview(spec.name, args, exec)
+          const review = await queueSendReview(spec.name, args, exec, { force: spec.name === 'bili_book_comment' && whaleForceReview() })
           if (review) return review
           return spec.execute(args, exec)
         }))
@@ -2900,6 +2901,73 @@ export function apply(ctx, config) {
     try { await whaleLedgerWrite((l) => withEvent(l, { code, detail, ...extra })) } catch (e) { log('whale ledger 事件写入失败（不致命）：' + String(e?.message ?? e)) }
   }
 
+  /* ── 🧭 运行边界（规格 §9.2/§9.4/§9.5；T6）─────────────────────────────────
+   * 两层数据源：ledger（机器写的业务账）+ stateDir/whale-bounds.json（本人维护的闸参数）。
+   * 判定全在 lib/whale-bounds.mjs 的纯函数里；这里只做「读 → 判 → 写账/停批次」。
+   * 人工动作用文件表达（模型无权改）：升档/改上限写 phase/dailyCap；停损恢复写 stopAck；
+   * 降速恢复写 speedAck —— 与 book-focus.json 同一个家目录口径。 */
+  const whaleBoundsFile = () => boundsFileOf(stateDir)
+  const whaleBoundsRead = () => { try { return readBounds(stateDir) } catch { return emptyBounds() } }
+  const whaleLedgerRead = () => { try { return readJson(whaleLedgerPath(), emptyLedger()) } catch { return emptyLedger() } }
+  /** 首 3 条人工批准（§9.3）：已成功发送数 < 3 ⇒ 强制入预览队列 */
+  const whaleForceReview = () => { try { return firstReviewOpen(whaleLedgerRead()) } catch { return false } }
+
+  /** 停批次（§9.5：「写 ledger 并停批次」）：会话态暂停 goal；后台态终止 headless 子进程。 */
+  const whaleStopBatch = (exec, reason) => {
+    try {
+      if (exec?.agent) {
+        const r = feiyuStop(exec.agent, 'whale-' + reason)
+        if (r && r.ok !== false) { log('书评线停批次（' + reason + '）：会话 goal 已暂停'); return }
+      }
+    } catch (e) { log('书评线停会话失败（不致命）：' + String(e?.message ?? e)) }
+    try {
+      if (dutyChild) { if (backgroundRun) backgroundRun.stopReason = 'whale-' + reason; terminateDutyChild(dutyChild); log('书评线停批次（' + reason + '）：已请求结束后台进程') }
+    } catch (e) { log('书评线停批次失败（不致命）：' + String(e?.message ?? e)) }
+  }
+
+  /** 发后 / V1 核验后的边界判定：恢复档结算 → 止损 → 降速 → 报警（§9.5）。 */
+  const whaleBoundsTick = async (exec, trigger) => {
+    const ledger = whaleLedgerRead()
+    const bounds = whaleBoundsRead()
+    // 降速：本人复核后写 bounds.speedAck（时间晚于降速起点）才清
+    if (ledger.speed?.downgraded && Date.parse(String(bounds.speedAck)) >= Date.parse(String(ledger.speed.since || 0))) {
+      await whaleLedgerWrite((l) => withSpeedCleared(l, { note: 'bounds.speedAck' }))
+      await whaleLedgerEvent('speed-restored', '人工复核（whale-bounds.json speedAck）', {})
+    }
+    // 恢复档：恢复首日那条的 V1 24h 判 hit ⇒ 回正常档；判 miss/invisible 只留一次告警
+    const verdict = recoveryVerdict(ledger)
+    if (verdict?.status === 'ok') {
+      await whaleLedgerWrite((l) => withRecoveryResult(l, { status: 'ok' }))
+      await whaleLedgerEvent('recovery-ok', '恢复首日那条 24h 可见 ⇒ 回正常档', {})
+    } else if (verdict?.status === 'unverified' && !(ledger.events || []).slice(-20).some((e) => e.code === 'recovery-unverified')) {
+      await whaleLedgerEvent('recovery-unverified', '恢复首日那条 24h 判 ' + verdict.v1 + ' ⇒ 维持 1 条/天，等人工复核', {})
+    }
+    const stop = evaluateStop(ledger, Date.now())
+    if (stop) {
+      const until = stopUntilOf(stop.level, Date.now())
+      await whaleLedgerWrite((l) => withStop(l, { level: stop.level, reason: stop.reason, detail: (stop.evidence || []).join('/'), ...until }))
+      await whaleLedgerEvent('stop-loss:' + stop.level, stop.reason + (stop.escalated ? '（同类信号再犯，升一档）' : '') + ' → 停到 ' + until.until, {})
+      log('whale 停损（' + trigger + '）：' + stop.level + ' ' + stop.reason + '，停到 ' + until.until)
+      whaleStopBatch(exec, 'stop-loss')
+      return
+    }
+    const speed = evaluateSpeed(ledger)
+    if (speed) {
+      await whaleLedgerWrite((l) => withSpeed(l, { reason: speed.reason }))
+      await whaleLedgerEvent('speed-down', speed.reason + ' ⇒ 降速 1 条/天（§9.5；人工复核后写 whale-bounds.json speedAck）', {})
+    }
+    for (const alert of evaluateAlerts(ledger)) await whaleLedgerEvent(alert.code, alert.detail, {})
+  }
+
+  /** 批起闸（§9.5）：停损未停满 / 停满未人工签 ⇒ 这一轮不开跑（runDuty 是同步的，只读判定）。 */
+  const whaleStartGate = () => {
+    const bounds = whaleBoundsRead()
+    const state = stopState(whaleLedgerRead(), bounds, Date.now())
+    if (state.active) return { ok: false, error: '书评线停损中（' + state.level + '，到 ' + state.until + '）：停满后按规格 §9.5 人工核验，再把 whale-bounds.json 的 stopAck 写成当前时间才能恢复。' }
+    if (state.needsAck) return { ok: false, error: '书评线停损已停满（' + (state.level || 'L1') + '，' + String(state.record?.reason ?? '') + '），但还没有人工核验签字：核验后把 ~/.dsh/bili-duty/whale-bounds.json 的 stopAck 写成当前时间，再开这一轮（恢复首日只发 1 条）。' }
+    return { ok: true, recovery: state.acked === true }
+  }
+
   const composeBookComment = async (args, exec) => {
     /* ⓪① 公共量先取（纯字符串操作，无 IO）⇒ blocked 的事件上下文直接读闭包。 */
     const bvid = String(args.bvid ?? '').trim()
@@ -2921,12 +2989,41 @@ export function apply(ctx, config) {
     if (cfg.dmMode === 'only' || !cfg.autoComment) {
       return blocked({ hint: '工作台 → 互动与投递中的「自动评论视频」未开启 —— 书评与普通评论共用这个开关；未开启时不跑书源门、不发送。' })
     }
+    /* ⑪ 运行边界（§9.2/§9.5；T6）：每日上限 + 停损 —— 都在书源门**之前**判：
+     *    达限/停损时连只读台账查询也不空跑，更不可能 claim（不可逆）。 */
+    const whNow = Date.now()
+    let whLedger = whaleLedgerRead()
+    let whBounds = whaleBoundsRead()
+    const whStop = stopState(whLedger, whBounds, whNow)
+    if (whStop.active) {
+      await whaleLedgerEvent('skipped:stop-loss', '停损中（' + whStop.level + '，到 ' + whStop.until + '）', { bvid, bookId: title })
+      whaleStopBatch(exec, 'stop-loss')
+      return blocked({ hint: '书评线停损中（' + whStop.level + '，停到 ' + whStop.until + '）：这条不发（记 skipped:stop-loss）；停满后人工核验并写 stopAck 才恢复。' })
+    }
+    if (whStop.expired && whStop.needsAck) {
+      return blocked({ hint: '书评线停损已停满（' + whStop.level + '），但还没有人工核验签字 —— 核验后把 ~/.dsh/bili-duty/whale-bounds.json 的 stopAck 写成当前时间；恢复首日只发 1 条。' })
+    }
+    /* 停满且已人工核验 ⇒ 清停损、进恢复档（首日 1 条/天，§9.5）。 */
+    if (whStop.expired && whStop.record && !whStop.needsAck) {
+      await whaleLedgerWrite((l) => withStopCleared(l, { ackAt: whBounds.stopAck, note: '停满 + 人工核验，进恢复档' }))
+      await whaleLedgerWrite((l) => withRecovery(l, { day: localDayOf(new Date(whNow)) }))
+      await whaleLedgerEvent('stop-cleared', '停损清除（' + whStop.level + '，' + String(whStop.record?.reason ?? '') + '），恢复首日 1 条/天', {})
+      whLedger = whaleLedgerRead()
+    }
+    const whCap = dailyCapState(whLedger, whBounds, whNow)
+    if (whCap.reached) {
+      await whaleLedgerEvent('skipped:daily-cap', '今日已发 ' + whCap.sent + '/' + whCap.cap + ' 条（' + whCap.phase + (whCap.recovery ? '·恢复日' : '') + (whCap.slowed ? '·降速' : '') + '）', { bvid, bookId: title })
+      whaleStopBatch(exec, 'daily-cap')
+      return blocked({ hint: '今天书评已到上限（' + whCap.sent + '/' + whCap.cap + ' 条，' + (whCap.recovery ? '停损恢复日只发 1 条' : whCap.slowed ? '降速期 1 条/天' : whCap.phase === 'stable' ? '稳定期上限' : '观察期 3 条/天') + '）—— 今天不再发新书评（记 skipped:daily-cap）；去翻字幕、回私信或写日报，明天再发。' })
+    }
+
     /* ① 本地预检（§5.2 入参契约）：bvid / 书名 / hook ≤90 字，超了直接回，不跑 gate。 */
     if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) {
       return blocked({ code: 'hook-invalid', hook_used: hookLen, hint: 'bvid 必须是 BV + 10 位字母数字（拿到「' + bvid.slice(0, 40) + '」）。' })
     }
     if (!title) return blocked({ code: 'hook-invalid', hook_used: hookLen, hint: 'title（书名）不能为空 —— 书源门按书名找资源。' })
-    if (!hook) return blocked({ code: 'hook-invalid', hook_used: 0, hook_left: 90, hint: 'hook 不能为空：先写 ≤90 字的钩子，落「这个视频里的具体一下」，不含链接/提取码。' })
+    // 空钩子 = 「写不出钩子」⇒ 记 no-hook（§10.1；连续 3 次由 whale-bounds 派生报警，§9.5）
+    if (!hook) return blocked({ code: 'no-hook', hook_used: 0, hook_left: 90, hint: 'hook 不能为空：先写 ≤90 字的钩子，落「这个视频里的具体一下」，不含链接/提取码。' })
     if (hookLen > 90) return blocked({ code: 'hook-invalid', hook_used: hookLen, hint: 'hook ' + hookLen + ' 字，超出 90 字预算 ' + (hookLen - 90) + ' 字 —— 删到 90 字以内再调（同轮最多重写 1 次）。' })
     /* ② 发送前判重（省 claim）：同视频一条（nu:，§8.3 保留）；同 UP 每日一条（up:）。
      *    uid 由宿主用 bili_video_info 取，取不到 ⇒ fail-closed 不发送并留痕（§8.3）。 */
@@ -3052,18 +3149,27 @@ export function apply(ctx, config) {
       const wlSent = sendOk(out)
       const wlGuard = String(out?.guard_status || (wlSent ? 'sent' : out?.blocked ? (out?.pace ? 'pace-blocked' : 'blocked') : 'unknown'))
       await whaleLedgerWrite((l) => withAfterSend(l, info.wlId, { rpid: wlRpid, guardStatus: wlGuard, sent: wlSent, errorCode: out?.code ?? null, postedAt: wlSent ? new Date().toISOString() : '' }))
+      let wlEvent = ''
+      let wlCode = ''
       if (!wlSent) {
         // 事件码口径（§8.4/§9.5）：pace 拦截**不算失败**（自有 pace-blocked 码）；质量/模板拦的是钩子
         // （hook-invalid）；12006/12014 用规格的 send-rejected:<码>；其余拒绝码用 send-rejected（码进
         // detail）；只有「发没发成未知」才记 send-unknown（§9.5 L1 触发码，不能被节奏拦截稀释）。
-        const wlCode = out?.code != null ? String(out.code) : ''
-        let wlEvent = 'send-unknown'
+        wlCode = out?.code != null ? String(out.code) : ''
+        wlEvent = 'send-unknown'
         if (wlGuard === 'pace-blocked' || out?.pace) wlEvent = 'pace-blocked'
         else if (out?.blocked && (out?.shallow || out?.template)) wlEvent = 'hook-invalid'
         else if (wlCode === '12006' || wlCode === '12014') wlEvent = 'send-rejected:' + wlCode
         else if (wlCode) wlEvent = 'send-rejected'
         await whaleLedgerEvent(wlEvent, (wlCode ? 'code=' + wlCode + ' ' : '') + String(out?.error || out?.hint || ''), { bvid: String(args.bvid ?? ''), bookId: info.bookId })
       }
+      /* 🧭 运行边界（§9.5；T6）：本次结果进连败/未知计数，官腔 warn 留痕，再跑一次止损判定
+       * （触发即写 ledger 并停批次）。pace/质量拦不是「发送失败」，不动连败计数。 */
+      const wlFailedSend = wlEvent === 'send-unknown' || wlEvent.startsWith('send-rejected')
+      await whaleLedgerWrite((l) => withSendOutcome(l, { ok: wlSent, fail: wlFailedSend, unknown: wlEvent === 'send-unknown' }))
+      const wlToneWarns = Array.isArray(out?.qualityWarn) ? out.qualityWarn.filter(Boolean) : []
+      if (wlToneWarns.length) await whaleLedgerEvent('tone-warn', wlToneWarns.join('；'), { bvid: String(args.bvid ?? ''), bookId: info.bookId })
+      await whaleBoundsTick(exec, 'send')
       /* 📇 发送成功才记账 book:/up:（§8.3 只发成功后写，不预占）；nu:/taste/seen 由发送链自己写。 */
       if (sendOk(out)) {
         const rpid = readableId(out.rpid_str ?? out.rpid ?? '0')
@@ -3502,7 +3608,7 @@ export function apply(ctx, config) {
     const rows = reviewBook()
     return {
       ok: true,
-      enabled: Boolean(cfg.sendReview),
+      enabled: Boolean(cfg.sendReview) || whaleForceReview(),
       rev: createHash('sha256').update(JSON.stringify([Boolean(cfg.sendReview), rows.map(row => [row.id, row.state, row.hash, row.updatedAt])])).digest('hex'),
       pending: rows.filter((row) => row.state === 'pending').length,
       sending: rows.filter((row) => row.state === 'approving').length,
@@ -3511,10 +3617,11 @@ export function apply(ctx, config) {
       ...(withItems ? { items: rows.slice(-SEND_REVIEW_MAX).reverse().map((row) => ({ ...row, args: reviewArgs(row.args) })) } : {}),
     }
   }
-  const queueSendReview = async (toolName, args, exec) => {
+  const queueSendReview = async (toolName, args, exec, opts = {}) => {
     if (!SEND_REVIEW_TOOLS.has(toolName)) return null
     refreshCfg()
-    if (!cfg.sendReview || approvedReviewArgs.has(args) || !isFishExecution(exec)) return null
+    // 书评线首 3 条（§9.3）：即使 sendReview 开关关着也必须人工批准 —— 由调用方传 force。
+    if ((!cfg.sendReview && !opts.force) || approvedReviewArgs.has(args) || !isFishExecution(exec)) return null
     const text = typeof args?.text === 'string' ? args.text.trim() : ''
     if (!text || text.length > (toolName === 'bili_moment' ? 300 : toolName === 'bili_dm_reply' ? 200 : toolName === 'bili_deliver' ? 500 : 1000)) return { ok: false, blocked: true, error: '发送预览需要有效且未超长的正文' }
     let clean
@@ -3578,8 +3685,10 @@ export function apply(ctx, config) {
     if (result?.error) return { ok: false, blocked: true, error: result.error }
     const saved = result?.row || row
     act('note', `${result?.duplicate ? '这条' : '新'}${saved.kind}已放进发送预览，等你点头`, { reviewId: saved.id, tool: toolName })
-    return { ok: true, queued: true, blocked: true, reviewId: saved.id, duplicate: Boolean(result?.duplicate), kind: saved.kind,
-      hint: '发送预览已打开：内容还没发出去，去桌宠「互动与投递」的待审核区批准或拒绝。' }
+    return { ok: true, queued: true, blocked: true, reviewId: saved.id, duplicate: Boolean(result?.duplicate), kind: saved.kind, forced: Boolean(opts.force && !cfg.sendReview),
+      hint: opts.force && !cfg.sendReview
+        ? '观察期首 3 条必须人工批准（规格 §9.3）——内容已放进发送预览，去桌宠「互动与投递」的待审核区逐条点头，没批准不会发。'
+        : '发送预览已打开：内容还没发出去，去桌宠「互动与投递」的待审核区批准或拒绝。' }
   }
   const decideSendReview = async (id, decision, expectedHash) => {
     const key = String(id || '').trim()
@@ -3596,6 +3705,16 @@ export function apply(ctx, config) {
       if (row.hash !== expectedHash || reviewHash(row) !== expectedHash) return { ok: false, error: '预览内容已变化，请重新查看后决定' }
       if (row.state !== 'pending') return { ok: false, already: true, item: row }
       if (decision === 'approve' && (!Number.isFinite(Date.parse(row.createdAt)) || Date.now() - Date.parse(row.createdAt) > 24 * 3600_000)) return { ok: false, error: '这条预览已超过 24 小时，请拒绝旧内容并重新生成，避免发送过时回复' }
+      /* 🧭 批准即发送：书评线在批准时再判一次边界（排队后可能已跨天/触发停损/达上限，§9.2/§9.5）
+       * —— 门不放行就留在待审核，不落 approving、不发。 */
+      if (decision === 'approve' && row.tool === 'bili_book_comment') {
+        const bounds = whaleBoundsRead()
+        const ledger = whaleLedgerRead()
+        const stop = stopState(ledger, bounds, Date.now())
+        if (stop.active || stop.needsAck) return { ok: false, error: '书评线停损中（' + String(stop.level || '') + '）：先按规格 §9.5 人工核验；门不放行时这条留在待审核。' }
+        const cap = dailyCapState(ledger, bounds, Date.now())
+        if (cap.reached) return { ok: false, error: '今天书评已到上限（' + cap.sent + '/' + cap.cap + ' 条）—— 这条留在待审核，明天再批。' }
+      }
       target = { ...row, args: reviewArgs(row.args) }
       rows[index] = { ...row, state: decision === 'approve' ? 'approving' : 'rejected', updatedAt: new Date().toISOString(), decidedAt: new Date().toISOString() }
       writeJson(dutyStateFile, { ...state, sendReview: rows })
@@ -3719,13 +3838,17 @@ export function apply(ctx, config) {
   const sweepWhaleV1 = (trigger) => {
     const cred = loadCredential(stateDir)
     if (!cred) return
-    sweepV1({
+    return sweepV1({
       trigger,
       readLedger: () => readJson(whaleLedgerPath(), emptyLedger()),
       writeRow: whaleLedgerWrite,
       cred,
       log: (m) => log(m),
-    }).catch((e) => log('whale V1 核验失败（不致命）：' + String(e?.message ?? e)))
+    }).then(async (result) => {
+      // V1 结果进账后立刻跑边界判定（降速/恢复档结算的数据源，§9.5）
+      if (result?.checked) await whaleBoundsTick(null, 'v1')
+      return result
+    }).catch((e) => { log('whale V1 核验失败（不致命）：' + String(e?.message ?? e)) })
   }
   const pushWhalePending = (trigger) => {
     const run = async () => {
@@ -4676,6 +4799,15 @@ export function apply(ctx, config) {
    let openedGrant = null, pendingLedgerId = ''
    try {
     refreshCfg()          // ⭐ 设置页刚改过的值要立刻生效（config 是就地改的，快照会过期）
+    /* 🧭 书评线运行边界（§9.5；T6）：停损未停满 / 停满未人工签 ⇒ 这一轮不开跑。
+     *    判定只读（runDuty 是同步函数）；清停损与恢复档在发送路径上懒执行。 */
+    if (!opts.review) {
+      const whaleGate = whaleStartGate()
+      if (!whaleGate.ok) {
+        log(`刷B站没开跑（${why}）：${whaleGate.error}`)
+        return { started: false, why, error: whaleGate.error, whaleStop: true }
+      }
+    }
     if (dutyChild) {
       const msg = '上一轮 headless 还没结束，这一轮先不叠上去（两个进程会写同一份报告、抢同一份额度）。'
       log(`刷B站没开跑（${why}）：${msg}`)
@@ -7043,6 +7175,22 @@ export function apply(ctx, config) {
       schedule: scheduleNow,
       learnReview: learningReviewStatus(),
       sendReview: (() => { try { return reviewSnapshot(false) } catch (error) { return { ok: false, enabled: Boolean(cfg.sendReview), error: String(error?.message ?? error), pending: null } } })(),
+      /* 🧭 书评线运行边界读数（§9.2/§9.5；T6）：上限/停损/降速一眼可见，真机验收（T7）靠它核对） */
+      whaleBounds: (() => {
+        try {
+          const bounds = whaleBoundsRead()
+          const ledger = whaleLedgerRead()
+          const cap = dailyCapState(ledger, bounds, Date.now())
+          const stop = stopState(ledger, bounds, Date.now())
+          return {
+            phase: cap.phase, cap: cap.cap, sent: cap.sent, recovery: cap.recovery, slowed: cap.slowed,
+            stop: stop.record ? { level: stop.level, until: stop.until, active: stop.active, needsAck: stop.needsAck, reason: String(stop.record?.reason ?? '') } : null,
+            failStreak: Number(ledger.fail_streak) || 0,
+            unknownStreak: Number(ledger.unknown_streak) || 0,
+            boundsFile: whaleBoundsFile(),
+          }
+        } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
+      })(),
       retrospective: sevenDayRetrospective(st),
       recovery: recoverySnapshot({ feiyu: feiyuNow, schedule: scheduleNow, state: st }),
       petShow: Boolean(cfg.petShow),

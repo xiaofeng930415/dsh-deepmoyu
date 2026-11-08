@@ -202,3 +202,30 @@ docs/ / marketplace/      部署、隐私、发布记录及市场条目
 - **升级**：`git fetch upstream --tags` → `git merge v2.X.Y` → `npm ci && npm test && node selfcheck.mjs` → 完全重启 → 打新 fork tag。
 - **回滚**：`git checkout whale-v2.6.0-1` + 完全重启；彻底回滚＝`pnpm add dsh-deepmoyu@2.6.0`。
 - **不改**上游 `prompts/duty.md`；改 `.py` 必须改本仓源码（`ensureHomeFiles` 会覆盖运行目录副本）。
+
+### 运行边界（T6）：每日上限 · 止损矩阵 · 首 3 条人工批准
+
+规格 §9.2/§9.4/§9.5 的宿主实现（判定在 `lib/whale-bounds.mjs`，形状在 `lib/whale-ledger.mjs`）：
+
+- **每日上限**：观察期 3 条/天、稳定期 5 条/天；达限拒绝并记 `skipped:daily-cap`。上限按 ledger 里
+  「当天 `sent:true` 的行」硬数，不看模型记性。
+- **首 3 条人工批准**（§9.3）：书评已成功发送数 < 3 时，即使「发送前审核」开关关着也强制进预览队列
+  （不会直发）；第 4 条起回到开关语义。
+- **止损矩阵**：L0（12014 / render-error）停当日、L1（风控码 -352/-412/-509/-799、连续 3 次非 pace
+  发送失败、send-unknown）停 24h、L2（DOM 核验 1 条 hidden）停 3 天、L3（hidden ≥2 或 ≥已发 20%、
+  同书/同 UP 二次 hidden）停 7 天；触发即写 ledger 并停批次（后台终止子进程、会话暂停 goal）。
+  已有未清除的停损期间，新的 开始一轮 会被直接拒绝。
+- **降速 1 条/天**（不停跑）：连续 2 次 send-unknown 或最近 2 条已发的 V1 全判 miss/invisible。
+  接口 miss 只当「待复核」，不单独判不可见（§9.5）。
+- **人工动作走文件**（模型无权改）：`~/.dsh/bili-duty/whale-bounds.json`
+  ```json
+  { "phase": "observation", "dailyCap": null, "stopAck": "", "speedAck": "", "note": "" }
+  ```
+  - 升档：`"phase": "stable"`（或直接给 `"dailyCap": 5`）；
+  - 停损恢复：停满 + 人工核验后把 `"stopAck"` 写成当前 ISO 时间（必须晚于停损起点）；
+    恢复首日只发 1 条，那条 24h 可见才回正常档；
+  - 降速恢复：`"speedAck"` 写成当前 ISO 时间。
+  文件缺失/损坏按观察期默认值处理（不会把插件卡死）。
+- **留痕**：`events[]` 追加 `skipped:daily-cap`、`skipped:stop-loss`、`stop-loss:L0..L3`、`stop-cleared`、
+  `speed-down`、`speed-restored`、`recovery-ok`、`alert:no-hook`、`alert:tone-warn` 等；
+  `/status` 的 `whaleBounds` 字段直接给出现读数（T7 真机验收核对用）。
