@@ -35,6 +35,7 @@ import { createToolScopeRegistry } from './lib/tool-scope.mjs'
 import { buildFeiyuObjective, buildLiveBrief, bookFocusBrief, MOMENT_OPENING_KEEP, interactionStyleGuide } from './lib/prompts.mjs'
 import { RUN_DEFAULTS, RUN_LIMITS, migrateRunSettings, clampRunSettings, resolveRunOptions, scheduleRunDeadline, backgroundWindowActive, backgroundWindowEndAt, backgroundWindowLaunch } from './lib/run-settings.mjs'
 import { AUTOMATION_DEFAULTS, AUTOMATION_LIMITS, clampAutomationSettings, dailyScheduleStatus, markDailyStarted, releaseDailyStart } from './lib/automation.mjs'
+import { planRelayAttempt, shouldResumeOnSlotFree, relayRemainingMs } from './lib/bg-relay.mjs'
 import { COMPANION_DEFAULTS, clampCompanionSettings, companionPolicy, companionPrompt, nextChatterAt } from './lib/companion.mjs'
 import { createPetSession } from './lib/pet-session.mjs'
 import { mutateLearningStateSync } from './lib/learn-store.mjs'
@@ -2939,6 +2940,7 @@ export function apply(ctx, config) {
     } catch (e) { log('书评线停会话失败（不致命）：' + String(e?.message ?? e)) }
     try {
       if (dutyChild) { if (backgroundRun) backgroundRun.stopReason = 'whale-' + reason; terminateDutyChild(dutyChild); log('书评线停批次（' + reason + '）：已请求结束后台进程') }
+      if (pendingRelay) clearPendingRelay('停损停批次：取消待接力窗口')
     } catch (e) { log('书评线停批次失败（不致命）：' + String(e?.message ?? e)) }
   }
 
@@ -4778,6 +4780,62 @@ export function apply(ctx, config) {
   let dutyTimer = null
   let backgroundRun = null
 
+  /* 🔁 提前收工后的自动接力（#1725）：原实现只 setTimeout 一次、且不看 runDuty 返回值
+   *    ⇒ 槽被学习审核轮（learn-review:auto，每 15s 一跳）抢到时静默放弃，之后没人把窗口
+   *    拉回来，无人值守长窗口静默缩水（2026-11-08 实测两次：承诺 84/88 分钟后直接结束）。
+   *    现在三件事（判据在 lib/bg-relay.mjs，纯函数单测覆盖；这里只做 spawn 与日志）：
+   *    ① 排接力时先登记 pendingRelay ⇒ auto 审核轮看到它就让位；
+   *    ② runDuty 回 {busy:true}（正常返回、不抛错）⇒ 5s/15s/30s 退避重试，到 deadline-2min 才放弃并留痕；
+   *    ③ 任意后台子进程退出（槽释放）⇒ 有待接力窗口就立刻拉起来（不等原定 timer）。 */
+  let pendingRelay = null
+  const relayMinutes = (remainMs) => Math.max(1, Math.ceil(Number(remainMs) / 60_000))
+  const clearPendingRelay = (note) => {
+    if (pendingRelay && pendingRelay.timer) { try { clearTimeout(pendingRelay.timer) } catch { /* 已经触发过 */ } }
+    pendingRelay = null
+    if (note) log(note)
+  }
+  const attemptRelay = () => {
+    const pending = pendingRelay
+    if (!pending) return
+    pending.timer = null
+    const remainMs = relayRemainingMs(pending.deadlineAt, Date.now())
+    if (!dutyChild) {
+      try {
+        const r = runDuty(pending.why, pending.opts)
+        if (r && r.started) { log('接力恢复（' + pending.why + '，剩余约 ' + relayMinutes(remainMs) + ' 分钟）'); pendingRelay = null; return }
+        if (!r || !r.busy) { log('接力放弃（' + String((r && r.error) || '没开跑') + '）'); pendingRelay = null; return }
+      } catch (e) { log('接力开跑失败（不影响宿主）：' + String(e && e.message ? e.message : e)) }
+    }
+    const plan = planRelayAttempt({ attempts: pending.attempts, slotBusy: true, remainingMs: remainMs })
+    if (plan.action !== 'retry') {
+      log(plan.reason === 'no-time' ? '接力放弃（剩余不足 2 分钟）' : '接力放弃（槽长期被占）')
+      pendingRelay = null
+      return
+    }
+    pending.attempts += 1
+    log('接力被占（剩余约 ' + relayMinutes(remainMs) + ' 分钟）⇒ ' + Math.round(plan.delayMs / 1_000) + ' 秒后重试（第 ' + pending.attempts + ' 次）')
+    pending.timer = setTimeout(attemptRelay, plan.delayMs)
+    if (pending.timer.unref) pending.timer.unref()
+  }
+  const scheduleRelay = (why, opts, deadlineAt) => {
+    clearPendingRelay(null)
+    const plan = planRelayAttempt({ attempts: 0, slotBusy: false, remainingMs: relayRemainingMs(deadlineAt, Date.now()) })
+    if (plan.action !== 'start') { log('接力不排（剩余不足 2 分钟）'); return }
+    pendingRelay = { why: why, opts: opts, deadlineAt: Number(deadlineAt) || 0, attempts: 0, timer: null }
+    pendingRelay.timer = setTimeout(attemptRelay, plan.delayMs)
+    if (pendingRelay.timer.unref) pendingRelay.timer.unref()
+  }
+  const resumePendingRelay = (trigger) => {
+    if (!pendingRelay) return false
+    const remainMs = relayRemainingMs(pendingRelay.deadlineAt, Date.now())
+    if (!shouldResumeOnSlotFree({ pending: true, childStillRunning: Boolean(dutyChild), remainingMs: remainMs })) return false
+    if (pendingRelay.timer) { try { clearTimeout(pendingRelay.timer) } catch { /* 已经触发过 */ } }
+    log('槽释放（' + trigger + '）：待接力窗口还有约 ' + relayMinutes(remainMs) + ' 分钟，立刻恢复')
+    pendingRelay.timer = setTimeout(attemptRelay, 0)
+    if (pendingRelay.timer.unref) pendingRelay.timer.unref()
+    return true
+  }
+
   /* ── 🐾 桌宠日志（pet-log.jsonl，2026-10-26 桌宠化改造）───────────────────────
    * 桌宠小窗不在 dsh 界面里，读不了 duty.log（那是排障日志，机房味太重）；
    * 它只想知道「刚才发生了什么」的几行人话：代建了会话、开刷了、后台一轮跑完了、出错了。
@@ -5037,6 +5095,8 @@ export function apply(ctx, config) {
     dutyChild = child
     dutyGrant = openedGrant
     backgroundRun = runState
+    // #1725：有轮真的开跑了 ⇒ 待接力窗口已被接管（这一轮的收尾会重新排接力）；学习审核轮不接管 pet 窗口，保留 pendingRelay 等槽释放钩子
+    if (!opts.review) clearPendingRelay(null)
     try {
       const patch = { bgChildPid: child.pid, lastRunAt: new Date(t0).toISOString(), lastWhy: why }
       /* ⏳ 时段任务的墙钟起点：同一段（endAt 相同）只记第一次拉起，跨段自动重置 ——「连刷 3 小时的累」按它算 */
@@ -5080,6 +5140,9 @@ export function apply(ctx, config) {
       if (!runState.stopReason) runState.stopReason = code === 0 && !runState.error ? 'exit' : 'error'
       dutyDone()
       log(`刷B站结束（${why}，模型=${run.model}，code=${code}，停因=${runState.stopReason}）${runState.error ? '：' + runState.error : ''}`)
+      /* #1725：非干净收工（手动停/出错/停损）⇒ 取消待接力；否则若有待接力窗口（例如学习审核轮刚跑完），立刻恢复 */
+      if (pendingRelay && runState.stopReason !== 'exit') clearPendingRelay('本轮非干净收工，取消待接力窗口')
+      resumePendingRelay('后台轮退出')
       const measured = runState.usage || reconcileBgUsage(child.pid)
       try { trimBgUsage() } catch { /* 修剪失败不影响收账 */ }
       // 🧾 收任务账：有真数就记真数（「未计量」翻正），没有就保持 tokensUnknown
@@ -5145,10 +5208,7 @@ export function apply(ctx, config) {
         log(`这一轮提前收工，但说好要刷满 ⇒ 自动接着刷剩余约 ${remainMin} 分钟（第 ${chain} 次接力）`)
         petLog('bg-continue', { why, chain, remainMin })
         act('note', `后台一轮提前说做完了，还剩约 ${remainMin} 分钟——我自己接着刷。`)
-        const continueTimer = setTimeout(() => {
-          try { runDuty(why, { ...opts, _chain: chain, durationMinutes: remainMin }) } catch (e) { log(`接力开跑失败（不影响宿主）：${e?.message ?? e}`) }
-        }, 2_500)
-        continueTimer.unref?.()
+        scheduleRelay(why, { ...opts, _chain: chain, durationMinutes: remainMin }, runState.deadlineAt)
       }
       /* 🗨️ 收工小结（2026-10-28）：把这一趟翻译成一句人话冒给使用者 —— 时间分档、额度说破。
        *    ⚠️ 接力发生的轮次**不是收工**（2.5 秒后就接着刷），绝不发小结，否则时段任务会
@@ -5259,6 +5319,8 @@ export function apply(ctx, config) {
       if (automationDisposed) return { ok: false, started: false, error: '插件正在停止' }
       refreshCfg()
       if (dutyChild) return { ok: false, started: false, busy: true, error: '后台任务尚未结束' }
+      /* #1725：后台窗口还有待接力的轮 ⇒ 自动审核让位（手动审核照旧；它跑完槽释放钩子会把窗口接回来） */
+      if (why === 'auto' && pendingRelay) { log('学习审核（auto）让位：后台窗口还有待接力的轮，先把时长刷满'); return { ok: true, started: false, deferred: true, reason: 'relay-pending' } }
       if (feiyuAnyActive()) return { ok: false, started: false, busy: true, error: '鲸鱼摸鱼会话正在运行，稍后再审核' }
       if (why === 'auto' && !cfg.learnAutoReview) return { ok: true, started: false, disabled: true }
       const items = learningReviewBatch(learnLedger(), cfg.learnReviewBatchSize)
@@ -7254,6 +7316,8 @@ export function apply(ctx, config) {
       //    petShow —— 「隐藏桌宠」开关的镜像（设置页靠它显示唤回入口）。
       bgBusy: Boolean(dutyChild),
       backgroundRun: backgroundRun ? { ...backgroundRun } : null,
+      /* 🔁 待接力窗口（#1725）：有值说明这一轮收尾后还要自己接着刷；attempts>0 说明被别的后台轮占过槽 */
+      backgroundRelay: pendingRelay ? { why: String(pendingRelay.why), attempts: Number(pendingRelay.attempts) || 0, deadlineAt: Number(pendingRelay.deadlineAt) || 0, remainingMs: relayRemainingMs(pendingRelay.deadlineAt, Date.now()) } : null,
       /* ⭐ 后台时段任务：给前端显示「时段内一直刷 / 已挂免跑牌到几点」 */
       bgWindow: { start: String(cfg.backgroundWindowStart || ''), end: String(cfg.backgroundWindowEnd || ''), active: Boolean(String(cfg.backgroundWindowStart || '') && String(cfg.backgroundWindowEnd || '') && backgroundWindowActive(cfg.backgroundWindowStart, cfg.backgroundWindowEnd)), holdUntil: Number(st.bgWindowHold) || 0 },
       /* 🗨️🎨 显示层：petEvent 是桌宠「说话」的通道（收工小结/闲聊），mood 是心情色，
@@ -8000,6 +8064,7 @@ export function apply(ctx, config) {
           }
         } catch (e) { log(`挂免跑牌失败（不影响停止）：${e?.message ?? e}`) }
       }
+      if (pendingRelay) clearPendingRelay('手动停止：取消待接力窗口')
       if (!dutyChild) return sendJson(res, 200, { ok: true, already: 'stopped' })
       if (backgroundRun) backgroundRun.stopReason = 'user'
       const stopped = terminateDutyChild(dutyChild)
