@@ -190,12 +190,13 @@ test('T6 bounds: first 3 sends force review even with sendReview off; daily cap 
     if (name === 'bili_reply') return { success: true, rpid_str: SENT }
     throw new Error('UNEXPECTED_MCP_CALL: ' + name)
   }
+  let gateReply = null
   const cp = createRequire(import.meta.url)('node:child_process'), originalSpawn = cp.spawn
   cp.spawn = (command, args) => {
     spawns.push({ command, args })
     if (String(args?.[0] ?? '').endsWith('client.py')) {
       const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = () => true
-      queueMicrotask(() => { child.stdout.emit('data', Buffer.from(JSON.stringify(GATE_FOUND))); child.emit('close', 0) })
+      queueMicrotask(() => { child.stdout.emit('data', Buffer.from(JSON.stringify(gateReply || GATE_FOUND))); child.emit('close', 0) })
       return child
     }
     throw new Error('UNEXPECTED_SUBPROCESS: ' + String(command))
@@ -254,6 +255,35 @@ test('T6 bounds: first 3 sends force review even with sendReview off; daily cap 
     assert.equal(status.whaleBounds.phase, 'observation')
     assert.equal(status.whaleBounds.cap, 3)
     assert.ok(status.whaleBounds.boundsFile.endsWith('whale-bounds.json'))
+    /* ⑥ 恢复档（§9.5 恢复条件）：停满 + 人工签（whale-bounds.json stopAck）⇒ 组合路径清停损、
+     *    进恢复档；当天只放 1 条，第 2 条按恢复上限拒绝。 */
+    writeFileSync(join(home, 'state.json'), JSON.stringify({}))
+    writeFileSync(join(home, 'whale-bounds.json'), JSON.stringify({ phase: 'observation', stopAck: new Date(now + 1000).toISOString() }))
+    writeLedger({ stop: { level: 'L1', reason: 'risk-code', since: new Date(now - 48 * 3600_000).toISOString(), since_ts: now - 48 * 3600_000, until: new Date(now - 60_000).toISOString(), until_ts: now - 60_000, cleared_at: '' } })
+    const recovered = await execute('bili_book_comment', { bvid: BV, title: '合成的书名', hook: HOOK })
+    assert.equal(recovered.queued, true, JSON.stringify(recovered))
+    const ledgerAfter = readLedger()
+    assert.ok(ledgerAfter.stop.cleared_at, '停满 + 人工签 ⇒ 清除停损')
+    assert.equal(ledgerAfter.recovery.status, 'pending', '进入恢复档（首日 1 条/天）')
+    const recoveryRow = (await request('/send-review')).body.items[0]
+    const recoverySent = await request('/send-review', { id: recoveryRow.id, decision: 'approve', expectedHash: recoveryRow.hash })
+    assert.equal(recoverySent.body.sent, true, JSON.stringify(recoverySent.body))
+    const secondSend = await execute('bili_book_comment', { bvid: 'BV9999999999', title: '另一本书', hook: HOOK })
+    assert.equal(secondSend.blocked, true, JSON.stringify(secondSend))
+    assert.match(String(secondSend.hint), /上限/)
+    assert.ok(readLedger().events.some((e) => e.code === 'skipped:daily-cap'), '恢复日第 2 条按上限拒绝')
+    /* ⑦ L0 发送前信号（§9.5）：gate 报 render-error ⇒ 立刻落 L0 停损并停批次（不等发送后 tick） */
+    writeFileSync(join(home, 'state.json'), JSON.stringify({}))
+    writeFileSync(join(home, 'whale-bounds.json'), JSON.stringify({ phase: 'observation' }))
+    writeLedger({})
+    gateReply = { ok: false, code: 'render-error', detail: 'synthetic render failure' }
+    const renderOut = await execute('bili_book_comment', { bvid: BV, title: '合成的书名', hook: HOOK })
+    assert.equal(renderOut.blocked, true, JSON.stringify(renderOut))
+    assert.equal(renderOut.code, 'render-error')
+    const renderLedger = readLedger()
+    assert.equal(renderLedger.stop?.level, 'L0', 'render-error ⇒ L0 停当日：' + JSON.stringify(renderLedger.stop))
+    assert.ok(renderLedger.events.some((e) => e.code === 'render-error'), 'render-error 事件留痕')
+    assert.ok(renderLedger.events.some((e) => e.code === 'stop-loss:L0'), '停损落账留痕')
   } finally {
     for (const fn of cleanups.reverse()) try { fn() } catch {}
     cp.spawn = originalSpawn; syncBuiltinESMExports(); McpClient.prototype.call = original

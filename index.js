@@ -2959,6 +2959,13 @@ export function apply(ctx, config) {
     for (const alert of evaluateAlerts(ledger)) await whaleLedgerEvent(alert.code, alert.detail, {})
   }
 
+  /** 只跑「报警不停跑」（§9.5）：no-hook 这类发生在发送前的信号不会经过发后 tick，
+   *  必须在写事件之后单独评估一次（连续 3 次才报，报过不再重复）。 */
+  const whaleAlertsTick = async () => {
+    const ledger = whaleLedgerRead()
+    for (const alert of evaluateAlerts(ledger)) await whaleLedgerEvent(alert.code, alert.detail, {})
+  }
+
   /** 批起闸（§9.5）：停损未停满 / 停满未人工签 ⇒ 这一轮不开跑（runDuty 是同步的，只读判定）。 */
   const whaleStartGate = () => {
     const bounds = whaleBoundsRead()
@@ -2974,13 +2981,17 @@ export function apply(ctx, config) {
     const title = String(args.title ?? '').trim()
     const hook = String(args.hook ?? '').trim()
     const hookLen = Array.from(hook).length
-    const blocked = (extra) => {
+    /* ⚠️ async：事件必须**写完**再返回 —— 有些拦截（render-error 的 L0、no-hook 报警）要在
+     *  事件落账后立刻评估；composeBookComment 本身是 async，`return blocked(...)` 会被自动 await。 */
+    const blocked = async (extra) => {
       const code = String(extra.code || '')
       // 📇 事件码进 ledger（规格 §10.1 events[]，可追加）：hook-over 映射为规格名 hook-over-budget；
       //    posture 拦截（无 code 的开关闭合）不记，避免开关未开时刷事件。
       if (code) {
         const map = { 'hook-over': 'hook-over-budget' }
-        whaleLedgerEvent(map[code] || code, String(extra.hint ?? ''), { bvid, bookId: title })
+        await whaleLedgerEvent(map[code] || code, String(extra.hint ?? ''), { bvid, bookId: title })
+        // no-hook 报警（§9.5）不经过发后 tick —— 纯 no-hook 的轮也要能在连续 3 次时报出来
+        if (code === 'no-hook') await whaleAlertsTick()
       }
       return { ok: false, blocked: true, tool: 'bili_book_comment', ...extra }
     }
@@ -3012,8 +3023,8 @@ export function apply(ctx, config) {
     }
     const whCap = dailyCapState(whLedger, whBounds, whNow)
     if (whCap.reached) {
+      // §9.2 只要求「拒绝 + 记 skipped:daily-cap」——不停批次（发现层照常跑，§9.5 的停批次只归止损矩阵）
       await whaleLedgerEvent('skipped:daily-cap', '今日已发 ' + whCap.sent + '/' + whCap.cap + ' 条（' + whCap.phase + (whCap.recovery ? '·恢复日' : '') + (whCap.slowed ? '·降速' : '') + '）', { bvid, bookId: title })
-      whaleStopBatch(exec, 'daily-cap')
       return blocked({ hint: '今天书评已到上限（' + whCap.sent + '/' + whCap.cap + ' 条，' + (whCap.recovery ? '停损恢复日只发 1 条' : whCap.slowed ? '降速期 1 条/天' : whCap.phase === 'stable' ? '稳定期上限' : '观察期 3 条/天') + '）—— 今天不再发新书评（记 skipped:daily-cap）；去翻字幕、回私信或写日报，明天再发。' })
     }
 
@@ -3058,13 +3069,16 @@ export function apply(ctx, config) {
     )
     if (!gate.ok || !gate.found) {
       const code = !gate.ok && gate.code ? String(gate.code) : 'gate-miss'
-      return blocked({
+      const out = await blocked({
         code,
         ...(gate.detail ? { detail: String(gate.detail) } : {}),
         hint: code === 'gate-miss'
           ? '「' + title + '」没有可用资源（gate-miss）—— 不发送、不记账；换一条视频或换一本书，别换关键词反复试同一本。'
           : GATE_FAIL_HINTS[code] || '书源门未知结果 —— 不评论、本轮不重试（fail-closed）。',
       })
+      // §9.5 L0：render-error 是**发送前**信号，事件写完必须立刻跑一次边界判定，否则不会停批次
+      if (code === 'render-error') await whaleBoundsTick(exec, 'gate')
+      return out
     }
     const bookId = String(gate.bookId ?? '')
     const block = String(gate.block ?? '')
@@ -3695,6 +3709,22 @@ export function apply(ctx, config) {
     if (!/^sr-[a-f0-9]{20}$/.test(key)) return { ok: false, error: 'reviewId 无效' }
     if (!['approve', 'reject'].includes(decision)) return { ok: false, error: 'decision 只能是 approve / reject' }
     if (!/^[a-f0-9]{64}$/.test(String(expectedHash || ''))) return { ok: false, error: '请重新查看预览后提交 expectedHash' }
+    /* 🧭 停损恢复（§9.5）：停满 + 人工核验后，**批准路径**同样要先清停损、进恢复档——
+     * 否则待审核条目会绕过「恢复首日只发 1 条」（组合路径的懒清除只覆盖新调用）。 */
+    if (decision === 'approve') {
+      let pre = null
+      try { pre = (readJson(dutyStateFile, {}).sendReview || []).find((item) => item?.id === key) || null } catch { /* 读不到就按非书评处理 */ }
+      if (pre?.tool === 'bili_book_comment') {
+        const bounds = whaleBoundsRead()
+        const ledger = whaleLedgerRead()
+        const stop = stopState(ledger, bounds, Date.now())
+        if (stop.expired && stop.record && !stop.needsAck) {
+          await whaleLedgerWrite((l) => withStopCleared(l, { ackAt: bounds.stopAck, note: '停满 + 人工核验，进恢复档（批准路径）' }))
+          await whaleLedgerWrite((l) => withRecovery(l, { day: localDayOf(new Date()) }))
+          await whaleLedgerEvent('stop-cleared', '停损清除（' + stop.level + '，' + String(stop.record?.reason ?? '') + '），恢复首日 1 条/天（批准路径）', {})
+        }
+      }
+    }
     let target = null
     const claimed = await withStateLock(() => {
       const state = readReviewState()
