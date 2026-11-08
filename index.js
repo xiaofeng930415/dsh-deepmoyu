@@ -3065,8 +3065,10 @@ export function apply(ctx, config) {
     for (let uidAttempt = 1; uidAttempt <= 2 && !upUid; uidAttempt++) {
       try {
         videoInfo = await call('bili_video_info', { bvid })
-        upUid = readableId(videoInfo?.owner?.mid, { allowZero: false })
-        if (!upUid) uidErr = '回执缺 owner.mid（bvid=' + bvid + '）'
+        // owner_mid 是 fork 给 bili_video_info 加的平铺字段（上游只给 author 名字，见 vendor 头注）；
+        // owner.mid 保留为旧形回执的兜底（两个都在就优先平铺字段）。
+        upUid = readableId(videoInfo?.owner_mid ?? videoInfo?.owner?.mid, { allowZero: false })
+        if (!upUid) uidErr = '回执缺 owner.mid / owner_mid（bvid=' + bvid + '）'
       } catch (e) {
         uidErr = String(e?.message ?? e).slice(0, 160)
         if (uidAttempt === 1) await new Promise(r => setTimeout(r, 2000))

@@ -26,7 +26,7 @@ test('book review queues the final composed bytes and approval sends them withou
   const original = McpClient.prototype.call
   McpClient.prototype.call = async function(name, args) {
     calls.push({ name, args })
-    if (name === 'bili_video_info') return { bvid: BV, title: '合成的讲书视频', owner: { mid: UID } }
+    if (name === 'bili_video_info') return { bvid: BV, title: '合成的讲书视频', owner_mid: UID, owner: { mid: UID } }
     if (name === 'bili_reply') return { success: true, rpid_str: SENT }
     throw new Error('UNEXPECTED_MCP_CALL: ' + name)
   }
@@ -119,7 +119,7 @@ test('book review reject keeps the claim result unused and sends nothing; permis
   const original = McpClient.prototype.call
   McpClient.prototype.call = async function(name, args) {
     calls.push({ name, args })
-    if (name === 'bili_video_info') return { bvid: BV, title: '合成的讲书视频', owner: { mid: UID } }
+    if (name === 'bili_video_info') return { bvid: BV, title: '合成的讲书视频', owner_mid: UID, owner: { mid: UID } }
     if (name === 'bili_reply') return { success: true, rpid_str: SENT }
     throw new Error('UNEXPECTED_MCP_CALL: ' + name)
   }
@@ -186,7 +186,7 @@ test('T6 bounds: first 3 sends force review even with sendReview off; daily cap 
   const original = McpClient.prototype.call
   McpClient.prototype.call = async function(name, args) {
     calls.push({ name, args })
-    if (name === 'bili_video_info') return { bvid: BV, title: '合成的讲书视频', owner: { mid: UID } }
+    if (name === 'bili_video_info') return { bvid: BV, title: '合成的讲书视频', owner_mid: UID, owner: { mid: UID } }
     if (name === 'bili_reply') return { success: true, rpid_str: SENT }
     throw new Error('UNEXPECTED_MCP_CALL: ' + name)
   }

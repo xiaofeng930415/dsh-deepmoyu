@@ -872,12 +872,18 @@ async def bili_video_info(bvid: str) -> str:
             "duration": p.get("duration", 0),
         } for p in pages]
 
+    # 🐋 fork 本地补丁（2026-11-08，T6 真机自证发现）：上游只输出 author 名字、把 owner.mid 丢了，
+    #    而舰鱼书评线要用 UP 的 mid 做 up:<uid> 每日判重与 ledger 的 mid 字段 ⇒ uid 预检永远 fail-closed。
+    #    只增字段、不动既有字段（上游回贡候选）：owner.mid（字符串化由 stringify_ids 统一处理）+ owner_mid 平铺别名。
+    owner = info.get("owner") if isinstance(info.get("owner"), dict) else {}
     return json.dumps({
         "bvid": info.get("bvid"),
         "aid": info.get("aid"),
         "title": info.get("title"),
         "description": info.get("desc"),
-        "author": info.get("owner", {}).get("name"),
+        "author": owner.get("name"),
+        "owner": {"mid": owner.get("mid"), "name": owner.get("name")},
+        "owner_mid": str(owner.get("mid")) if owner.get("mid") is not None else None,
         "duration": info.get("duration"),
         "pages": len(pages),
         "tags": [t.get("tag_name") for t in info.get("tag", []) if t.get("tag_name")],

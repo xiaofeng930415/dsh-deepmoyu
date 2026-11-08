@@ -198,6 +198,9 @@ docs/ / marketplace/      部署、隐私、发布记录及市场条目
 
 - **基线**：上游 `v2.6.0`；工作分支 `whale-book-comment`；fork tag `whale-v2.6.0-1`（每个上游版本打一次）。
 - **改造**（按主题拆 commit，可单独回贡）：`bili_book_comment` 工具 + 书评模式官腔闸 warn + `book:`/`up:` 判重键 + 后台白名单收窄 + `prompts/book-review.md` + `vendor/book-gate/`（仓库逐字副本）。
+- **上游文件补丁 1（2026-11-08，T6 真机发现）**：`vendor/bilibili-mcp/mcp_server.py` 的 `bili_video_info` 增补
+  `owner`（含 mid/name）与平铺 `owner_mid`，只增字段、不动既有字段——上游只输出 `author` 名字，
+  宿主书评线的 `up:<uid>` 判重与 ledger `mid` 即使不上 ⇒ uid 预检永远 fail-closed。上游回贡候选。
 - **安装**：`cd ~/.dsh/profiles/desktop && pnpm add "link:$HOME/gitstore/dsh-deepmoyu"`，然后**完全退出 App 重开**。
 - **升级**：`git fetch upstream --tags` → `git merge v2.X.Y` → `npm ci && npm test && node selfcheck.mjs` → 完全重启 → 打新 fork tag。
 - **回滚**：`git checkout whale-v2.6.0-1` + 完全重启；彻底回滚＝`pnpm add dsh-deepmoyu@2.6.0`。
