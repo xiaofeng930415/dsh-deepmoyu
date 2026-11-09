@@ -3910,6 +3910,7 @@ export function apply(ctx, config) {
       void whaleV2Check('v1')
       return result
     }).catch((e) => { log('whale V1 核验失败（不致命）：' + String(e?.message ?? e)) })
+  }
 
   /* ⏱️ V1 补核（#1743）：T+30min/T+24h 的定时器是**内存**里的，App 重启即清空；兜底只有后台轮
    *    批起/批止 sweep ⇒ 重启后不开轮就没人核（2026-11-09 实测延后 7 小时 20 分）。
@@ -3926,7 +3927,6 @@ export function apply(ctx, config) {
       log('whale V1 补核检查失败（不致命）：' + String(e?.message ?? e))
       return 0
     }
-  }
   }
   /* ── 🐋 V2 DOM 抽样核验（规格 §10.4；T5c/T7 折入）────────────────────────
    * 只对 ①V1 判 miss/invisible ②每天随机 1 条（上限 3 条/天）跑；专用临时 profile 的
