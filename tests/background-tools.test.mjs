@@ -60,6 +60,9 @@ test('background MCP shares host activity, pending learning, usage and live auto
     const client = createRelayClient(childEnv), list = (await backgroundMcpRequest({ id: 1, method: 'tools/list' }, client)).result.tools
     assert.ok(list.some(x => x.name === 'bili_reply')); assert.ok(list.some(x => x.name === 'bili_learn'))
     for (const name of ['bili_dm_reply', 'bili_moment', 'bili_config', 'bili_run', 'bili_setup', 'bili_comment', 'bili_book_comment']) assert.ok(!list.some(x => x.name === name), name)
+    // 📚 2026-11-09 内容范围：非书籍内容入口（热榜/排行/热词）移除；UP 跟新保留
+    for (const name of ['bili_rank', 'bili_hot_videos', 'bili_buzzwords']) assert.ok(!list.some(x => x.name === name), name)
+    assert.ok(list.some(x => x.name === 'bili_user_videos'))
     assert.ok(!('force' in list.find(x => x.name === 'bili_reply').inputSchema.properties))
     let seq = 1
     const call = async (name, args) => {

@@ -4631,8 +4631,8 @@ export function apply(ctx, config) {
           : Number(opts.durationMinutes) > 0 ? `本次计划刷约 ${opts.durationMinutes} 分钟，` : '本轮刷到节奏账本建议收工为止，')
         + '做完一轮（找片 → 读字幕 → 挑着互动 → 记一句）就接着开下一轮，中间按节奏闸自然休息；时间没到就继续找新视频、翻评论区、整理待审材料，别提前收工。先读章程 ' + duty + '。',
       buildLiveBrief({ cfg, day: dayKey(), picked: countPickedToday(), moments: countMomentsToday(), outDir, digestDir, recentOpenings: recentMomentOpenings(), bookFocus: bookFocusLine() }),
-      '按自己的兴趣找近7天的新视频，读字幕原文后判断；没找到合适的可以空手。可爱、吐槽和闲话都行，不靠固定自称、颜文字或关键词证明人格。',
-      '书评线：后台发带资源的新评论只用 bili_book_comment —— 你写 ≤90 字钩子（hook），书源门与口令块注入由宿主完成，链接/提取码永远不经你的手；动手前先读 ' + join(pluginDir, 'prompts', 'book-review.md') + '，今日书单看 LiveBrief 的【今日书单】行（没有就照常随机刷，不发书评）。',
+      '内容范围（2026-11-09 本人定）：只看看书籍相关视频（讲书 / 解读 / 读书 / 书评 / 书籍介绍）；热榜、排行、热词、娱乐、生活、游戏、新闻等非书籍内容一律不看。发现走两条路：① 今日书单的书名 + 四后缀搜索；② 讲书 UP 主的近期更新（bili_user_videos，只看 7 天内新稿）。挑片标准：近期更新 + 当前播放量低于该 UP 近期平均播放（先用 bili_user_videos 的 play 算均值再挑）；读字幕原文后判断，没找到合适的可以空手。可爱、吐槽和闲话都行，不靠固定自称、颜文字或关键词证明人格。',
+      '书评线：后台发带资源的新评论只用 bili_book_comment —— 你写 ≤90 字钩子（hook），书源门与口令块注入由宿主完成，链接/提取码永远不经你的手；动手前先读 ' + join(pluginDir, 'prompts', 'book-review.md') + '，今日书单看 LiveBrief 的【今日书单】行（没有就空手，不发书评、也不刷非书籍内容）。',
       '开关只代表允许：不要求每挑一条就评、不要求发动态、不要求每轮学习或写心情。发送未知是否成功不能重发；收到节奏或冷却拒绝就换只读的事做。',
       '本进程通过宿主工具桥调用同一套鲸鱼摸鱼工具，以实际注册说明为准：bili_buzzwords 看热词，bili_seen 查刷过的片，bili_say 留选片旁白；bili_learn 只收集待审材料，不能自行批准；bili_soul 只记真实互动感受。发送前问 bili_pace，评论用 bili_reply / bili_reply_opus，私信开着时用 bili_dm_inbox / bili_dm_reply。共享开关、判重与节奏账本，未授权工具不可用。',
       '回复开着时先看看自己投稿下的评论，再看收到的回复；私信开着才翻收件箱，想接谁就接谁，不清空通知也不算欠账。ID按十进制字符串原样传。',
