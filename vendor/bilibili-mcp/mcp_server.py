@@ -1854,6 +1854,46 @@ async def bili_followings(uid: IdInput = "", pn: int = 1, ps: int = 50, attentio
     }, ensure_ascii=False)
 
 
+# ========== Tool 18c: 补关注（写动作） ==========
+
+@tool()
+async def bili_follow(mid: IdInput) -> str:
+    """关注一个 UP 主（写动作；当前登录账号身份）。已关注/互关时幂等返回 already=true。
+
+    Args:
+        mid: 要关注的用户 UID
+    """
+    cred = get_cred()
+    try:
+        target = int(normalize_id(mid, allow_zero=False))
+    except (TypeError, ValueError) as e:
+        return json.dumps({"ok": False, "error": str(e), "invalid_id": True}, ensure_ascii=False)
+    u = user.User(uid=target, credential=cred)
+    name = ""
+    try:
+        info = await u.get_user_info()
+        name = str(info.get("name") or "")
+    except Exception:
+        pass
+    try:
+        rel = await u.get_relation_info()
+        attribute = int(rel.get("attribute") or 0)
+        if attribute in (2, 6):
+            return json.dumps({"ok": True, "already": True, "followed": False, "mid": str(target), "uname": name, "attribute": attribute}, ensure_ascii=False)
+    except Exception:
+        pass
+    try:
+        await u.modify_relation(user.RelationType.SUBSCRIBE)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": "%s: %s" % (type(e).__name__, e), "mid": str(target), "uname": name}, ensure_ascii=False)
+    try:
+        rel2 = await u.get_relation_info()
+        attribute2 = int(rel2.get("attribute") or 0)
+    except Exception:
+        attribute2 = 0
+    return json.dumps({"ok": True, "followed": True, "already": False, "mid": str(target), "uname": name, "attribute": attribute2}, ensure_ascii=False)
+
+
 # ========== Tool 19: 收藏夹列表 ==========
 
 @tool()

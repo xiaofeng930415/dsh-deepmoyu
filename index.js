@@ -36,6 +36,7 @@ import { buildFeiyuObjective, buildLiveBrief, bookFocusBrief, MOMENT_OPENING_KEE
 import { RUN_DEFAULTS, RUN_LIMITS, migrateRunSettings, clampRunSettings, resolveRunOptions, scheduleRunDeadline, backgroundWindowActive, backgroundWindowEndAt, backgroundWindowLaunch } from './lib/run-settings.mjs'
 import { AUTOMATION_DEFAULTS, AUTOMATION_LIMITS, clampAutomationSettings, dailyScheduleStatus, markDailyStarted, releaseDailyStart } from './lib/automation.mjs'
 import { planRelayAttempt, shouldResumeOnSlotFree, relayRemainingMs } from './lib/bg-relay.mjs'
+import { emptyFollowPool, normalizeFollowPool, mergeFollowPool, followPoolFresh, selectFollowBatch, followPoolHas, invalidateFollowPool, annotateUpVideos, planFollow, recordFollow } from './lib/whale-followings.mjs'
 import { COMPANION_DEFAULTS, clampCompanionSettings, companionPolicy, companionPrompt, nextChatterAt } from './lib/companion.mjs'
 import { createPetSession } from './lib/pet-session.mjs'
 import { mutateLearningStateSync } from './lib/learn-store.mjs'
@@ -1432,19 +1433,84 @@ export function apply(ctx, config) {
     },
   })
 
+  /* 🐟 关注池（2026-11-09 T2）：本地缓存 + 轮转，避免每轮全量拉关注列表、也避免总从第一个 UP 开始 */
+  const followPoolPath = () => join(stateDir, 'whale-followings.json')
+  const readFollowPool = () => { try { const p = readJson(followPoolPath(), null); return p && typeof p === 'object' && Array.isArray(p.ups) ? p : emptyFollowPool() } catch { return emptyFollowPool() } }
+  const writeFollowPool = (pool) => { try { writeJson(followPoolPath(), pool) } catch (e) { log('关注池落盘失败（不影响本轮）：' + String(e?.message ?? e)) } }
+  const refreshFollowPool = async () => {
+    try {
+      const raw = await call('bili_followings', { all_pages: true, ps: 50, attention: false })
+      if (!raw || raw.ok !== true) return { ok: false, error: String(raw?.error ?? 'followings-failed') }
+      const fresh = normalizeFollowPool(raw.list, { nowTs: Date.now(), total: raw.total })
+      const pool = mergeFollowPool(readFollowPool(), fresh)
+      writeFollowPool(pool)
+      return { ok: true, pool }
+    } catch (e) { return { ok: false, error: String(e?.message ?? e) } }
+  }
+  const followBatch = async () => {
+    let pool = readFollowPool()
+    if (!followPoolFresh(pool, Date.now())) {
+      const r = await refreshFollowPool()
+      if (!r.ok) return { ok: false, code: 'follow-pool-unavailable', hint: '关注列表拉取失败：本轮只用书单搜索找片，别硬试跟新入口。', error: r.error }
+      pool = r.pool
+    }
+    if (!Array.isArray(pool.ups) || !pool.ups.length) return { ok: false, code: 'follow-pool-empty', hint: '关注列表是空的：本轮只用书单搜索找片。' }
+    const picked = selectFollowBatch(pool, { size: 8 })
+    writeFollowPool(picked.pool)
+    return {
+      ok: true, source: 'follow-pool',
+      batch: picked.batch.map((u) => ({ mid: u.mid, uname: u.uname, sign: u.sign, followed_days_ago: u.followedDaysAgo })),
+      pool: { total: Number(picked.pool.total) || picked.pool.ups.length, fetchedAt: picked.pool.fetchedAt, cursor: picked.pool.cursor },
+      hint: '这些是你关注的 UP：逐个用 bili_user_videos 看近期更新，只挑 7 天内且「目前播放量低于该 UP 近期平均」的片。',
+    }
+  }
+
+  const followUp = async (rawMid) => {
+    const mid = normalizeId(rawMid, { allowZero: false })
+    const pool = readFollowPool()
+    if (followPoolHas(pool, mid)) return { ok: true, already: true, followed: false, mid, hint: '这个 UP 已经在关注池里了，不用再关注；继续看他/她的近期更新。' }
+    const day = localDayOf(new Date())
+    const stats = readJson(dutyStateFile, {}).followStats
+    const roundId = backgroundRun && backgroundRun.active ? String(backgroundRun.id || 'run') : 'session'
+    const plan = planFollow({ stats, roundId, day })
+    if (!plan.ok) {
+      return { ok: false, blocked: true, code: plan.code, mid, hint: plan.code === 'follow-daily-cap' ? '今天补关注已到上限（3 个）——别再关注，继续看讲书视频。' : '这一轮已经补过 1 个关注了——同一轮只关注 1 个，先继续看片。' }
+    }
+    const out = await call('bili_follow', { mid })
+    if (out && out.ok === true) {
+      await withStateLock(() => {
+        const st = readJson(dutyStateFile, {})
+        st.followStats = recordFollow(st.followStats, { day, roundId, followed: out.followed === true, mid, uname: out.uname || '' })
+        writeJson(dutyStateFile, st)
+      })
+      if (out.followed === true) {
+        writeFollowPool(invalidateFollowPool(pool, Date.now()))
+        act('note', '补关注了讲书 UP：' + (out.uname || mid))
+        log('补关注（' + mid + ' ' + (out.uname || '') + '）：' + day + ' 第 ' + (plan.count + 1) + '/3 个')
+      }
+    }
+    return out
+  }
+
   tool({
     name: 'bili_followings',
     description: '读 B站 关注列表（默认鲸鱼号自己的关注；也可读指定用户的前 5 页）。\n'
       + '只用于「只看讲书 UP 主」的发现路径：拿到关注 UP 的 mid 后，用 bili_user_videos 看他的近期更新。\n'
-      + '⚠️ 一页最多 50 个；all_pages=true 只在刷新本地关注池时用（仅自己账号可全量）。',
+      + '⚠️ 一页最多 50 个；all_pages=true 只在刷新本地关注池时用（仅自己账号可全量）。\n'
+      + '⭐ 后台跟新用它 batch:true —— 返回本轮轮转的 8 个关注 UP（缓存 6h，失败时明确回落「只用书单搜索」）。',
     parameters: {
+      action: { type: 'string', description: 'list=读关注列表（默认）/ follow=补关注一个讲书 UP 主' },
+      mid: { type: 'string', description: 'action=follow 时必填：要关注的 UP UID' },
       uid: { type: 'string', description: '用户 UID（留空 = 当前登录账号自己）' },
       pn: { type: 'number', description: '页码（默认 1）' },
       ps: { type: 'number', description: '每页几条（默认 50，最多 50）' },
       attention: { type: 'boolean', description: 'true=按最常访问排序；false=按关注顺序（默认）' },
       all_pages: { type: 'boolean', description: 'true=自动翻页拉全量（仅自己账号）' },
+      batch: { type: 'boolean', description: 'true=取本轮关注池轮转批次（每轮 8 个 UP，自动刷新/回落）' },
     },
     async execute(args) {
+      if (String(args.action || '') === 'follow') return followUp(args.mid)
+      if (args.batch === true) return followBatch()
       return call('bili_followings', {
         ...(args.uid ? { uid: normalizeId(args.uid, { allowZero: false }) } : {}),
         pn: Math.max(1, Number(args.pn) || 1),
@@ -4654,7 +4720,7 @@ export function apply(ctx, config) {
           : Number(opts.durationMinutes) > 0 ? `本次计划刷约 ${opts.durationMinutes} 分钟，` : '本轮刷到节奏账本建议收工为止，')
         + '做完一轮（找片 → 读字幕 → 挑着互动 → 记一句）就接着开下一轮，中间按节奏闸自然休息；时间没到就继续找新视频、翻评论区、整理待审材料，别提前收工。先读章程 ' + duty + '。',
       buildLiveBrief({ cfg, day: dayKey(), picked: countPickedToday(), moments: countMomentsToday(), outDir, digestDir, recentOpenings: recentMomentOpenings(), bookFocus: bookFocusLine() }),
-      '内容范围（2026-11-09 本人定）：只看看书籍相关视频（讲书 / 解读 / 读书 / 书评 / 书籍介绍）；热榜、排行、热词、娱乐、生活、游戏、新闻等非书籍内容一律不看。发现走两条路：① 今日书单的书名 + 四后缀搜索；② 讲书 UP 主的近期更新（bili_user_videos，只看 7 天内新稿）。挑片标准：近期更新 + 当前播放量低于该 UP 近期平均播放（先用 bili_user_videos 的 play 算均值再挑）；读字幕原文后判断，没找到合适的可以空手。可爱、吐槽和闲话都行，不靠固定自称、颜文字或关键词证明人格。',
+      '内容范围（2026-11-09 本人定）：只看看书籍相关视频（讲书 / 解读 / 读书 / 书评 / 书籍介绍）；热榜、排行、热词、娱乐、生活、游戏、新闻等非书籍内容一律不看。发现走两条路：① 今日书单的书名 + 四后缀搜索；② 讲书 UP 主的近期更新（bili_user_videos，只看 7 天内新稿）。挑片标准：近期更新 + 当前播放量低于该 UP 近期平均播放（先用 bili_user_videos 的 play 算均值再挑）；读字幕原文后判断，没找到合适的可以空手。刷到讲书 UP 主（确认在讲书）且还没关注 ⇒ 用 bili_followings 的 action="follow" 补关注（每天最多 3 个、每轮最多 1 个，宿主会拦；被拦就继续看片）。可爱、吐槽和闲话都行，不靠固定自称、颜文字或关键词证明人格。',
       '书评线：后台发带资源的新评论只用 bili_book_comment —— 你写 ≤90 字钩子（hook），书源门与口令块注入由宿主完成，链接/提取码永远不经你的手；动手前先读 ' + join(pluginDir, 'prompts', 'book-review.md') + '，今日书单看 LiveBrief 的【今日书单】行（没有就空手，不发书评、也不刷非书籍内容）。',
       '开关只代表允许：不要求每挑一条就评、不要求发动态、不要求每轮学习或写心情。发送未知是否成功不能重发；收到节奏或冷却拒绝就换只读的事做。',
       '本进程通过宿主工具桥调用同一套鲸鱼摸鱼工具，以实际注册说明为准：bili_buzzwords 看热词，bili_seen 查刷过的片，bili_say 留选片旁白；bili_learn 只收集待审材料，不能自行批准；bili_soul 只记真实互动感受。发送前问 bili_pace，评论用 bili_reply / bili_reply_opus，私信开着时用 bili_dm_inbox / bili_dm_reply。共享开关、判重与节奏账本，未授权工具不可用。',
