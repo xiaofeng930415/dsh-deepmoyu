@@ -297,3 +297,15 @@ App 重启就丢；兜底只有后台轮「批起/批止 sweep」——**没有�
 - 后台白名单移除 `bili_rank` / `bili_hot_videos` / `bili_buzzwords`（非书籍内容入口）；**保留 `bili_user_videos`（UP 跟新）**——用户会关注讲书 UP 主，跟新是唯一合法的主动发现入口。
 - 挑片标准：**7 天内更新 + 当前播放量低于该 UP 近期平均播放量**（用 `bili_user_videos` 返回的每稿 `play` 算均值再比）。没找到合适的可以空手。
 - 该口径**覆盖**规格 §7.3「随机刷只为自然度」的设计；发书评仍只发【今日书单】内的书（书单外的片可看不可发）。
+
+### 关注池与「只看讲书 UP 主」（2026-11-09，#1752/#1753/#1761/#1763）
+
+用户口径：只看书籍相关视频；发现走「书单搜索 + 关注的讲书 UP 主近期更新」；刷到讲书博主补关注。
+
+- `bili_followings`（新工具）：读关注列表——自己账号可全量翻页（最多 40 页/2000）、别人号前 5 页；
+  `batch:true` 走**关注池轮转**：宿主持有 `DUTY/whale-followings.json`（TTL 6h、全量分页刷新、游标轮转每轮 8 个 UP）；
+  关注列表空/拉取失败 ⇒ 明确回落「只用书单搜索」（`follow-pool-empty` / `follow-pool-unavailable`）。
+- `bili_followings({action:'follow', mid})`：**补关注**讲书 UP——关注池去重、每天 ≤3 个、每轮 ≤1 个（宿主保证，不靠模型记性）、
+  成功留痕并让关注池缓存失效；原生 `bili_follow` 幂等（已关注返回 `already=true`，不占额度）。
+- `bili_user_videos` 回执附带 `play_avg` / `below_avg`（该 UP 本次返回列表均值；7 天内且 play<均值才 true）⇒ 挑片只挑 `below_avg=true`。
+- 回归：`tests/whale-followings.test.mjs`（6 例：池规范化/TTL/游标/去重/失效/均值标注/限流）；tool-surface 证据矩阵 40→**41** 工具。

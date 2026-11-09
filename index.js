@@ -1429,7 +1429,12 @@ export function apply(ctx, config) {
         order: String(args.order || 'pubdate'),
         keyword: String(args.keyword || ''),
       })
-      return withSeen(raw, (o) => o.videos ?? o.items ?? o.list, 'videos')
+      /* 📈 2026-11-09 T3：挑片基准 —— 回执附带 play_avg（本次返回列表均值）与 below_avg
+       *    （7 天内且 play < 均值），模型只挑 below_avg=true 的片；纯函数在 lib/whale-followings.mjs。 */
+      const annotated = raw && Array.isArray(raw.videos)
+        ? { ...raw, videos: annotateUpVideos(raw.videos), value_rule: '只看 7 天内且 play < play_avg（该 UP 本次返回列表均值）的片' }
+        : raw
+      return withSeen(annotated, (o) => o.videos ?? o.items ?? o.list, 'videos')
     },
   })
 
@@ -4720,7 +4725,7 @@ export function apply(ctx, config) {
           : Number(opts.durationMinutes) > 0 ? `本次计划刷约 ${opts.durationMinutes} 分钟，` : '本轮刷到节奏账本建议收工为止，')
         + '做完一轮（找片 → 读字幕 → 挑着互动 → 记一句）就接着开下一轮，中间按节奏闸自然休息；时间没到就继续找新视频、翻评论区、整理待审材料，别提前收工。先读章程 ' + duty + '。',
       buildLiveBrief({ cfg, day: dayKey(), picked: countPickedToday(), moments: countMomentsToday(), outDir, digestDir, recentOpenings: recentMomentOpenings(), bookFocus: bookFocusLine() }),
-      '内容范围（2026-11-09 本人定）：只看看书籍相关视频（讲书 / 解读 / 读书 / 书评 / 书籍介绍）；热榜、排行、热词、娱乐、生活、游戏、新闻等非书籍内容一律不看。发现走两条路：① 今日书单的书名 + 四后缀搜索；② 讲书 UP 主的近期更新（bili_user_videos，只看 7 天内新稿）。挑片标准：近期更新 + 当前播放量低于该 UP 近期平均播放（先用 bili_user_videos 的 play 算均值再挑）；读字幕原文后判断，没找到合适的可以空手。刷到讲书 UP 主（确认在讲书）且还没关注 ⇒ 用 bili_followings 的 action="follow" 补关注（每天最多 3 个、每轮最多 1 个，宿主会拦；被拦就继续看片）。可爱、吐槽和闲话都行，不靠固定自称、颜文字或关键词证明人格。',
+      '内容范围（2026-11-09 本人定）：只看看书籍相关视频（讲书 / 解读 / 读书 / 书评 / 书籍介绍）；热榜、排行、热词、娱乐、生活、游戏、新闻等非书籍内容一律不看。发现走两条路：① 今日书单的书名 + 四后缀搜索；② 用 bili_followings({batch:true}) 拿本轮 8 个关注的讲书 UP，再用 bili_user_videos 看他们的近期更新（回执带 play_avg / below_avg，只挑 below_avg=true 的）。挑片标准：近期更新 + 当前播放量低于该 UP 近期平均播放（先用 bili_user_videos 的 play 算均值再挑）；读字幕原文后判断，没找到合适的可以空手。刷到讲书 UP 主（确认在讲书）且还没关注 ⇒ 用 bili_followings 的 action="follow" 补关注（每天最多 3 个、每轮最多 1 个，宿主会拦；被拦就继续看片）。可爱、吐槽和闲话都行，不靠固定自称、颜文字或关键词证明人格。',
       '书评线：后台发带资源的新评论只用 bili_book_comment —— 你写 ≤90 字钩子（hook），书源门与口令块注入由宿主完成，链接/提取码永远不经你的手；动手前先读 ' + join(pluginDir, 'prompts', 'book-review.md') + '，今日书单看 LiveBrief 的【今日书单】行（没有就空手，不发书评、也不刷非书籍内容）。',
       '开关只代表允许：不要求每挑一条就评、不要求发动态、不要求每轮学习或写心情。发送未知是否成功不能重发；收到节奏或冷却拒绝就换只读的事做。',
       '本进程通过宿主工具桥调用同一套鲸鱼摸鱼工具，以实际注册说明为准：bili_buzzwords 看热词，bili_seen 查刷过的片，bili_say 留选片旁白；bili_learn 只收集待审材料，不能自行批准；bili_soul 只记真实互动感受。发送前问 bili_pace，评论用 bili_reply / bili_reply_opus，私信开着时用 bili_dm_inbox / bili_dm_reply。共享开关、判重与节奏账本，未授权工具不可用。',
