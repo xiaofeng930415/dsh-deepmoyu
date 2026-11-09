@@ -1782,6 +1782,78 @@ async def bili_user_videos(uid: IdInput, pn: int = 1, ps: int = 30, order: str =
     }, ensure_ascii=False)
 
 
+# ========== Tool 18b: 关注列表（鲸鱼号书单发现用） ==========
+
+@tool()
+async def bili_followings(uid: IdInput = "", pn: int = 1, ps: int = 50, attention: bool = False, all_pages: bool = False) -> str:
+    """
+    获取B站用户关注列表（自己账号可全量；别人账号只能看前 5 页）
+
+    Args:
+        uid: 用户UID（留空 = 当前登录的鲸鱼号自己）
+        pn: 页码，从 1 开始
+        ps: 每页条数（默认 50，最大 50）
+        attention: True=按「最常访问」排序；False=按关注顺序
+        all_pages: True=自动翻页拉全量（仅自己账号；最多 40 页 / 2000 个）
+
+    Returns:
+        ok / uid / self / total / pages_fetched / is_end / list[{mid, uname, sign, mtime, followed_days_ago}]
+    """
+    cred = get_cred()
+    self_uid = str(getattr(cred, "dedeuserid", "") or "").strip()
+    if not self_uid:
+        return json.dumps({"ok": False, "error": "登录凭证里没有 dedeuserid，无法确定本账号 UID"}, ensure_ascii=False)
+    if uid in (None, ""):
+        target = self_uid
+    else:
+        try:
+            target = normalize_id(uid, allow_zero=False)
+        except (TypeError, ValueError) as e:
+            return json.dumps({"ok": False, "error": str(e), "invalid_id": True}, ensure_ascii=False)
+    is_self = str(target) == self_uid
+    page_size = max(1, min(int(ps or 50), 50))
+    if not all_pages:
+        max_pages = 1
+    else:
+        max_pages = 40 if is_self else 5
+    u = user.User(uid=int(target), credential=cred)
+    rows, fetched, is_end, total = [], 0, False, 0
+    try:
+        start_page = max(1, int(pn or 1))
+        for i in range(max_pages):
+            data = await u.get_followings(pn=start_page + i, ps=page_size, attention=attention)
+            fetched += 1
+            page = (data or {}).get("page") or {}
+            total = max(total, int(page.get("total") or 0))
+            items = (data or {}).get("list") or []
+            for item in items:
+                mtime = int(item.get("mtime") or 0)
+                rows.append({
+                    "mid": str(item.get("mid") or ""),
+                    "uname": str(item.get("uname") or ""),
+                    "sign": str(item.get("sign") or "")[:120],
+                    "mtime": mtime,
+                    "followed_days_ago": _days_ago(mtime),
+                    "attribute": int(item.get("attribute") or 0),
+                })
+            is_end = bool(page.get("is_end")) or not items
+            if is_end or not all_pages or len(rows) >= 2000:
+                break
+            await asyncio.sleep(0.35)
+    except Exception as e:  # noqa: BLE001 —— 固定脚本必须结构化失败
+        return json.dumps({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, ensure_ascii=False)
+    return json.dumps({
+        "ok": True,
+        "uid": str(target),
+        "self": is_self,
+        "total": total,
+        "pages_fetched": fetched,
+        "is_end": is_end,
+        "count": len(rows),
+        "list": rows,
+    }, ensure_ascii=False)
+
+
 # ========== Tool 19: 收藏夹列表 ==========
 
 @tool()

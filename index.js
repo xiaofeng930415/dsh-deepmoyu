@@ -1432,6 +1432,29 @@ export function apply(ctx, config) {
     },
   })
 
+  tool({
+    name: 'bili_followings',
+    description: '读 B站 关注列表（默认鲸鱼号自己的关注；也可读指定用户的前 5 页）。\n'
+      + '只用于「只看讲书 UP 主」的发现路径：拿到关注 UP 的 mid 后，用 bili_user_videos 看他的近期更新。\n'
+      + '⚠️ 一页最多 50 个；all_pages=true 只在刷新本地关注池时用（仅自己账号可全量）。',
+    parameters: {
+      uid: { type: 'string', description: '用户 UID（留空 = 当前登录账号自己）' },
+      pn: { type: 'number', description: '页码（默认 1）' },
+      ps: { type: 'number', description: '每页几条（默认 50，最多 50）' },
+      attention: { type: 'boolean', description: 'true=按最常访问排序；false=按关注顺序（默认）' },
+      all_pages: { type: 'boolean', description: 'true=自动翻页拉全量（仅自己账号）' },
+    },
+    async execute(args) {
+      return call('bili_followings', {
+        ...(args.uid ? { uid: normalizeId(args.uid, { allowZero: false }) } : {}),
+        pn: Math.max(1, Number(args.pn) || 1),
+        ps: Math.max(1, Math.min(Number(args.ps) || 50, 50)),
+        attention: args.attention === true,
+        all_pages: args.all_pages === true,
+      })
+    },
+  })
+
   /* ── 💬 评论回复的判重账本（2026-10-20 使用者要求「有人回复自己的评论，那就都回复一下」）──
    * 上限取消之后，**判重就是唯一的刹车**：B站 的「收到的回复」通知会一直把同一条列出来，
    * 不判重的话她每轮都会对着同一个人再说一遍（刷屏 ✗）。判据在 lib/reply.mjs，这里只读盘/记账。 */

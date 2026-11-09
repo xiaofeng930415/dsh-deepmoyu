@@ -63,6 +63,7 @@ test('background MCP shares host activity, pending learning, usage and live auto
     // 📚 2026-11-09 内容范围：非书籍内容入口（热榜/排行/热词）移除；UP 跟新保留
     for (const name of ['bili_rank', 'bili_hot_videos', 'bili_buzzwords']) assert.ok(!list.some(x => x.name === name), name)
     assert.ok(list.some(x => x.name === 'bili_user_videos'))
+    assert.ok(list.some(x => x.name === 'bili_followings'), 'followings list is available to the background discovery path')
     assert.ok(!('force' in list.find(x => x.name === 'bili_reply').inputSchema.properties))
     let seq = 1
     const call = async (name, args) => {

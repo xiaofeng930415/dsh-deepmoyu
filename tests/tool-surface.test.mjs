@@ -45,6 +45,7 @@ export const TOOL_SURFACE_EVIDENCE = Object.freeze({
   bili_rank: [{ category: 'knowledge', day: 7 }, 'readonly', 'manual-browsing.test.mjs'],
   bili_hot_videos: [{ pn: 3, ps: 80 }, 'readonly', 'manual-browsing.test.mjs'],
   bili_user_videos: [{ uid: UID, pn: 7, ps: 12, order: 'click', keyword: '合成投稿' }, 'readonly', 'tool-surface.test.mjs'],
+  bili_followings: [{ pn: 2, ps: 12, attention: true, all_pages: false }, 'readonly', 'tool-surface.test.mjs'],
   bili_seen: [{ action: 'mark', bvid: BV, note: '合成的已读理由' }, 'local', 'memory-chain.test.mjs'],
   bili_received_replies: [{}, 'readonly', 'reply.test.mjs'],
   bili_my_notices: [{ num: 100 }, 'readonly', 'memory-chain.test.mjs'],
@@ -88,6 +89,7 @@ const readContracts = {
   bili_rank: ['bili_rank', { category: 'knowledge', day: 7 }, discovery],
   bili_hot_videos: ['bili_hot_videos', { pn: 3, ps: 50 }, discovery],
   bili_user_videos: ['bili_user_videos', { uid: UID, pn: 7, ps: 12, order: 'click', keyword: '合成投稿' }, discovery],
+  bili_followings: ['bili_followings', { pn: 2, ps: 12, attention: true, all_pages: false }, out => { assert.equal(out.ok, true); assert.equal(out.self, true); assert.equal(out.list[0].mid, UID); assert.equal(out.list[0].uname, '合成关注UP') }],
   bili_received_replies: ['bili_received_replies', {}, out => { assert.equal(out.ok, true); assert.equal(out.items[0].reply_rpid, RPID); assert.equal(out.items[0].root_rpid, ROOT); assert.equal(out.items[0].can_reply, true); assert.equal(out.items[1].can_reply, false) }],
   bili_my_notices: ['bili_my_notices', { num: 30 }, out => { assert.equal(out.ok, true); assert.equal(out.count, 7); assert.equal(out.likes[0].item_id, RPID); assert.equal(out.ats[0].uid, UID) }],
   bili_my_dynamics: ['bili_my_dynamics', { num: 30 }, out => { assert.equal(out.ok, true); assert.equal(out.items[0].opus_id, OPUS); assert.equal(out.withComments, 1) }],
@@ -106,6 +108,7 @@ function discovery(out) {
 }
 
 const sourceReply = name => {
+  if (name === 'bili_followings') return { ok: true, uid: UID, self: true, total: 3, pages_fetched: 1, is_end: true, count: 2, list: [{ mid: UID, uname: '合成关注UP', sign: '讲书', mtime: 1794000000, followed_days_ago: 5 }, { mid: '999', uname: '另一个UP', sign: '', mtime: 1793000000, followed_days_ago: 16 }] }
   if (['bili_search', 'bili_rank', 'bili_hot_videos', 'bili_user_videos'].includes(name)) return { videos: [{ bvid: SEEN, play: 999 }, { bvid: BV, play: 30 }, { bvid: FRESH, play: 70 }, { bvid: FRESH, play: 70 }] }
   if (name === 'bili_guard_status') return { ok: true, seenVideos: { [SEEN]: { at: '2026-10-29', title: '合成永久已读' } } }
   if (name === 'bili_check_credential') return { mid: UID, name: '合成账号', valid: true }
@@ -206,7 +209,7 @@ async function fixture(run, { permissions = false, worker = false, login = false
   }
   try {
     apply(ctx, {}); await immediate()
-    assert.deepEqual([...tools.keys()].sort(), Object.keys(TOOL_SURFACE_EVIDENCE).sort()); assert.equal(tools.size, 40)
+    assert.deepEqual([...tools.keys()].sort(), Object.keys(TOOL_SURFACE_EVIDENCE).sort()); assert.equal(tools.size, 41)
     await run({ root, home, fish, normal, goals, tools, calls, subprocesses, fetches, execute, request, child: () => child, async select(preset) { fish.session.header.agentPreset = preset; for (const fn of events.get('agent-preset/selected') || []) await fn(fish.id, preset); await immediate() } })
     if (!worker && !login && !installer && !gate) assert.deepEqual(subprocesses, [], 'read/local/send fixture must not run Python or any subprocess')
     if (!login) assert.deepEqual(fetches, [], 'MCP fixtures must not call a network endpoint')
@@ -366,7 +369,7 @@ test('bili_book_comment gate-miss sends nothing and writes no dedup key', async 
 }, { permissions: true, gate: { ok: true, found: false } }))
 
 test('the 40-item evidence matrix references existing portable specialist suites', () => {
-  assert.equal(Object.keys(TOOL_SURFACE_EVIDENCE).length, 40)
+  assert.equal(Object.keys(TOOL_SURFACE_EVIDENCE).length, 41)
   assert.deepEqual([...successfulContracts].sort(), Object.keys(TOOL_SURFACE_EVIDENCE).sort(), 'every registered tool must have completed a positive contract, not merely an invalid-input refusal')
   for (const [name, [args, category, file]] of Object.entries(TOOL_SURFACE_EVIDENCE)) {
     assert.ok(args && typeof args === 'object' && !Array.isArray(args), name)
