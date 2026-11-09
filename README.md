@@ -277,3 +277,16 @@ headless 槽，抢到之后又没人把 pet 窗口拉回来 ⇒ 无人值守长�
 - **可观测**：`/status` 新增 `backgroundRelay`（`why` / `attempts` / `deadlineAt` / `remainingMs`）；
   日志关键词 `接力恢复` / `接力被占` / `接力放弃` / `槽释放` / `让位`。
 - **回归**：`node --test tests/bg-relay.test.mjs`（7 例：首次 2.5s、重试 0s、5/15/30s 封顶、剩余不足即放弃、槽释放判据）。
+
+### V1 补核巡检（#1743，2026-11-09）：重启后不再静默延后
+
+V1（T+30min / T+24h，规格 §10.3）原本只靠**发送时挂的内存定时器**（`index.js` 发送成功分支里的 `setTimeout`），
+App 重启就丢；兜底只有后台轮「批起/批止 sweep」——**没有后台轮启动就没人核**（2026-11-09 实测延后
+7 小时 20 分：凌晨 01:22/01:28 发两条，直到 09:13 手动开 1 分钟空跑触发批起 sweep 才补上）。
+
+现在：
+- `sweepWhaleV1IfDue(trigger)`：只读 ledger 跑 `dueV1Checks(..., {max:4})`，**有到期才**真跑 sweep
+  （不联网、不空转；当日志出现 `whale V1 补核（启动/巡检/manual）：到期 N 条` 即命中）；
+- 插件启动后 8 秒补一次 + **每 60 秒轻量巡检**（只读一个小 JSON）⇒ 重启后最多 60 秒内补齐；
+- `/status` 增 `whaleV1: { due }`（重启后应收敛到 0）；
+- 手动口 `POST /api/bili-duty/whale/v1`（返回本次到期条数，sweep 异步跑）。

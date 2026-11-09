@@ -3910,6 +3910,23 @@ export function apply(ctx, config) {
       void whaleV2Check('v1')
       return result
     }).catch((e) => { log('whale V1 核验失败（不致命）：' + String(e?.message ?? e)) })
+
+  /* ⏱️ V1 补核（#1743）：T+30min/T+24h 的定时器是**内存**里的，App 重启即清空；兜底只有后台轮
+   *    批起/批止 sweep ⇒ 重启后不开轮就没人核（2026-11-09 实测延后 7 小时 20 分）。
+   *    这里只读 ledger 跑 dueV1Checks（纯函数），**有到期才**真跑 sweep（不联网、不空转）；
+   *    由插件启动一次 + 每 60 秒轻量巡检调用。手动口见 POST /api/bili-duty/whale/v1。 */
+  const sweepWhaleV1IfDue = (trigger) => {
+    try {
+      const due = dueV1Checks(whaleLedgerRead(), Date.now(), { max: 4 })
+      if (!due.length) return 0
+      log('whale V1 补核（' + trigger + '）：到期 ' + due.length + ' 条（内存定时器可能被重启清掉过）')
+      void sweepWhaleV1(trigger)
+      return due.length
+    } catch (e) {
+      log('whale V1 补核检查失败（不致命）：' + String(e?.message ?? e))
+      return 0
+    }
+  }
   }
   /* ── 🐋 V2 DOM 抽样核验（规格 §10.4；T5c/T7 折入）────────────────────────
    * 只对 ①V1 判 miss/invisible ②每天随机 1 条（上限 3 条/天）跑；专用临时 profile 的
@@ -7369,6 +7386,10 @@ export function apply(ctx, config) {
             : { checked: 0 }
         } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
       })(),
+      /* ⏱️ V1 待核数（#1743）：重启后靠它确认「补核巡检」已把该核的补完（应收敛到 0） */
+      whaleV1: (() => {
+        try { return { due: dueV1Checks(whaleLedgerRead(), Date.now(), { max: 9 }).length } } catch (error) { return { ok: false, error: String(error?.message ?? error) } }
+      })(),
       retrospective: sevenDayRetrospective(st),
       recovery: recoverySnapshot({ feiyu: feiyuNow, schedule: scheduleNow, state: st }),
       petShow: Boolean(cfg.petShow),
@@ -7950,6 +7971,11 @@ export function apply(ctx, config) {
       }
     }
 
+    /* ⏱️ V1 手动补核（#1743）：返回「这次到期几条」，sweep 异步跑（不阻塞 HTTP）。运维/演练用。 */
+    if (req.method === 'POST' && path === '/api/bili-duty/whale/v1') {
+      try { return sendJson(res, 200, { ok: true, due: sweepWhaleV1IfDue('manual') }) } catch (e) { return sendJson(res, 200, { ok: false, error: String(e?.message ?? e) }) }
+    }
+
     /* 🐟 鲸鱼摸鱼模式：设置页那几个按钮
      * ⚠️ 这里有个天然限制：HTTP 那半边**没有 agent 上下文**（它不是一个对话），
      *    所以只能操作"上次在对话里开过的那个 agent"。真正的启动入口是对话里的
@@ -8390,6 +8416,16 @@ export function apply(ctx, config) {
     timer?.unref?.(); startup?.unref?.()
     return () => { automationDisposed = true; clearInterval(timer); clearTimeout(startup) }
   }, 'bili-duty: 每日窗口与学习模型审核')
+
+  /* ⏱️ V1 补核巡检（#1743）：发送时挂的内存定时器被重启清掉后，靠这一跳在 60 秒内补齐。
+   *    只读一个小 JSON；没有到期条目就什么都不做（不联网、不写账）。 */
+  ctx.effect(() => {
+    const kick = () => { try { sweepWhaleV1IfDue('巡检') } catch { /* 巡检不许影响宿主 */ } }
+    const startup = setTimeout(kick, 8_000)
+    const timer = setInterval(kick, 60_000)
+    startup?.unref?.(); timer?.unref?.()
+    return () => { clearTimeout(startup); clearInterval(timer) }
+  }, 'bili-duty: V1 补核巡检')
 
   /* 📁 记录镜像的兜底定时器（挂载时已经同步过一次了）——
    * ⭐ unref()：它是"顺手刷新"，不能反过来钉住进程退出（selfcheck.mjs 的假 ctx 会因此挂死）。
