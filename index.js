@@ -91,6 +91,9 @@ import {
 // ✍️ 评论质量的**硬下限**（只判"有没有内容"，不判好不好）—— 2026-10-20 使用者要求「不能单纯为了哗众取宠」
 import { commentQuality, templateCheck, recentTexts, TEMPLATE_STREAK, bookHookOf } from './lib/comment.mjs'
 import { callBookGate } from './lib/book-gate.mjs'
+// 📗 私信线判据（T3：求资源判定 + 书名抽取）与台账（T4：dm 段）—— 与书评线同形不同文件
+import { dmResourceIntent } from './lib/dm-intent.mjs'
+import { dmLedgerFile, emptyDmLedger, writeDmLedgerFile, withDmRow, withDmEvent } from './lib/dm-ledger.mjs'
 import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile, withV1Result, withIngest, dueV1Checks, selectPendingIngest, withStop, withStopCleared, withRecovery, withRecoveryResult, withSpeed, withSpeedCleared, withSendOutcome, withDomResult } from './lib/whale-ledger.mjs'
 import { probeDom, judgeDomResult, pickV2Targets } from './lib/whale-dom.mjs'
 import { readBounds, boundsFileOf, firstReviewOpen, dailyCapState, stopState, stopUntilOf, evaluateStop, evaluateSpeed, evaluateAlerts, recoveryVerdict } from './lib/whale-bounds.mjs'
@@ -578,6 +581,8 @@ export function apply(ctx, config) {
     dmMode: 'off', dmUid: 0,
     keywords: [], commentPerRound: 1, mentionName: '', pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1,
     autoReplyDm: false, dmReplyPerDay: 0, dmReplyFollowedOnly: true,
+    // 📗 私信线书源门客户端路径覆盖（T4 测试缝；缺省空 = vendor/book-gate/client.py 唯一正路）
+    bookGateClient: '',
     // 🐟 鲸鱼摸鱼模式（键必须和 Config 里的一模一样，normalize 是按 base 的键挑的）
     persona: '', focus: '', autoMoment: false, momentPerDay: 1, momentStyle: '随心情', interactionStyle: 'companion', modelId: '', tokenBudget: 0, totalTokenBudget: 0, maxRounds: 64, mirrorDir: '', updateRegistry: '', updateMirror: true,
     // ⏱️ 出手节奏系数（1 = 标准；2 = 间隔翻倍；0.5 = 快一倍）—— 2026-10-21 使用者 m18802 第 1、2 条
@@ -2292,6 +2297,10 @@ export function apply(ctx, config) {
         const seenDm = dupLookup(replied, keyDmReply(seq, it.uid), legacyDmKeys(seq))
         const was = seenDm.hit ? { at: seenDm.at } : undefined
         const skip = dmSkipReason(it, dmJudgeCfg(), was)
+        // 📗 T4（规格 #1751 B 段）：规则先筛「像不像在要资源 + 书名候选」。
+        //   零 IO 纯函数，不花模型；模型看到的 `resource_intent` 就是它的抽名起点，
+        //   `need_ask=true` 时它该去读 bili_dm_thread 补上下文或者追问，**不许猜书名**。
+        const intent = dmResourceIntent(it.said ?? '', [])
         return {
           ...it,
           already_replied: seenDm.hit,
@@ -2302,6 +2311,12 @@ export function apply(ctx, config) {
           // ⭐ 判据只算一遍：`can_reply=false` 时 `skip_reason` 说清为什么，别自己猜
           can_reply: skip === '',
           skip_reason: skip,
+          resource_intent: {
+            seeking: intent.seeking,
+            titles: intent.titles,
+            need_ask: intent.needAsk,
+            reason: intent.reason,
+          },
         }
       })
       return {
@@ -2320,7 +2335,10 @@ export function apply(ctx, config) {
               ? '（⚠️ 有会话桶读失败，那一类人的私信这轮没看到，别当成没有）'
               : '')
           : '`can_reply=true` 的想回就回：bili_dm_reply(uid=…, text=…, msg_seqno=…)。'
-            + '`skip_reason` 说了为什么不能回的别硬回；**没有条数上限**，也不必每条都答。',
+            + '`skip_reason` 说了为什么不能回的别硬回；**没有条数上限**，也不必每条都答。\n'
+            + '📗 `resource_intent.seeking=true` 的是在要资源：`titles` 是规则抽出的书名候选，'
+            + '`need_ask=true` 时先读 bili_dm_thread 补上下文（补不出就追问一句，别猜书名）；'
+            + '确认书名后调 bili_dm_reply 带上 `book_title`，宿主跑书源门并把口令块逐字拼进正文。',
       }
     },
   })
@@ -2349,11 +2367,22 @@ export function apply(ctx, config) {
       + '⚠️ 但私信在 B站 举报权重里最重（是唯一直接推到别人手机的动作）：**别对着同一个人连着发**，'
       + '同一个 `msg_seqno` 只回一次（宿主记着账本），回得短、像人说话。\n'
       + '🔴 安全闸：「自动回复私信」默认关闭。只有本人在工作台手动打开后才允许发送；模型不能用 force 或配置 PATCH 绕过。\n'
-      + '⚠️ 同一个 `msg_seqno` 只回一次（宿主记着账本，重复回会被挡）。**没有每日条数上限** —— 想回就回，不想回就放着。',
+      + '⚠️ 同一个 `msg_seqno` 只回一次（宿主记着账本，重复回会被挡）。**没有每日条数上限** —— 想回就回，不想回就放着。\n'
+      /* ⭐ T4（规格 #1751 B/C 段）：求资源私信的书名抽取与口令块注入。
+       *   工具描述原来写着「别粘链接、别写手机号」——那句在求资源场景里直接堵死需求 2，
+       *   改成精确口径：链接**只能**来自宿主注入的书源门口令块，模型不许自己写链接，
+       *   也不许出现手机号 / 二维码 / 其它外链。 */
+      + '📗 **对方在要资源时**：书名可以自己从消息里抽（`bili_dm_thread` 能看上下文），'
+      + '但**链接与提取码不许自己写** —— 填 `book_title` 让宿主跑书源门，宿主会把口令块'
+      + '逐字拼进正文再发（模型只拿到块长度）。门没命中就明说没找到，别编资源。\n'
+      + '📏 正文上限 200 字（按**注入后**的全长算）：人话预算 = 200 − 口令块字数 − 换行；'
+      + '超了先把人话删短（下限 20 字），**绝不裁口令块**。',
     parameters: {
       uid: { type: 'string', required: true, description: '发给谁（对方 UID）' },
-      text: { type: 'string', required: true, description: '私信正文（短、像人说话、按人格；别粘链接、别写手机号）' },
+      text: { type: 'string', required: true, description: '私信正文：短、像人说话、按人格；**不要写链接/提取码/手机号/二维码** —— 链接只能由宿主经书源门注入' },
       msg_seqno: { type: 'string', description: '回的是哪一条（从 bili_dm_inbox 拿；填了才判重，**建议一定要填**）' },
+      book_title: { type: 'string', description: '（可选）对方在要的书名。填了 ⇒ 宿主跑书源门，把口令块逐字拼进正文；不填 ⇒ 纯闲聊回复。书名从消息或上下文抽，别猜' },
+      dry_run: { type: 'boolean', description: '（可选）只跑判定 + 书源门 + 字数核算，把「将要发送的全文」带回，**不发送**。验收用' },
       force: { type: 'boolean', description: '已停用；true 会被拒绝。模型参数不能代表本人授权，请通过工作台手动设置权限并审核。' },
     },
     async execute(args) {
@@ -2363,6 +2392,12 @@ export function apply(ctx, config) {
       const seqno = optionalId(args.msg_seqno)
       if (!uid) return { ok: false, error: 'uid 要填数字' }
       if (!text) return { ok: false, error: 'text 不能为空' }
+      // 📗 T4：书名（可选）—— 走书源门 ⇒ 口令块逐字注入；纯文本 ⇒ 原路径
+      const bookTitle = String(args.book_title ?? '').trim()
+      const dryRun = args.dry_run === true
+      // ⭐ 200 字上限**按注入后的全文**算（规格 C 段）：块 41–102 字，人话最少 20 字
+      //    ⇒ 纯闲聊时 text 最多 200；带块时 text 上限收紧到 200 − 20 = 180，
+      //      具体余量由书源门回来后按实测块长算（下面 gateOk 分支）。
       if (text.length > 200) return { ok: false, error: `私信太长（${text.length} 字）—— 200 字以内，短一点更像人` }
       // 闸门一：开关（跟 bili_reply 一个套路 —— 拿使用者的号说话，必须他明确开）
       if (!cfg.autoReplyDm && !args.force) {
@@ -2436,7 +2471,96 @@ export function apply(ctx, config) {
       const paceBlocked = paceGate('dm', Boolean(args.force))
       if (paceBlocked) return paceBlocked
 
-      const r = await call('bili_send_message', { receiver_uid: uid, text, msg_seqno: seqno })
+      /* ═══════════════════════════════════════════════════════════════════════
+       * 📗 T4（规格 #1751 B/C 段）：求资源私信 ⇒ 书源门 ⇒ 口令块逐字注入。
+       *
+       * 顺序与书评线一致（§5.2）：先过完所有闸门（开关/判重/防刷屏/收件箱复核/节奏），
+       * 最后一步才调书源门 —— 因为 gate 在网盘分支会触发**不可逆的 claim**，
+       * 前面任何一道闸门拦下时都不该空跑一次检索、更不该 claim（同 §6.6 的理由）。
+       *
+       * 三条硬约束（规格 C 段，测试逐条钉住）：
+       *   ① 块**逐字**注入：模型给的 text 一个字不改，块原样拼在后面；
+       *      模型不得改写/拆散/重排链接与提取码（它根本看不到块）。
+       *   ② 字数按**注入后**的全长算：超 200 先缩人话（下限 20 字），仍超就**拒发**，
+       *      绝不裁块。
+       *   ③ 门 miss ⇒ 明说没找到并给下一步，**不降级成裸链、不编替代资源**。
+       * ═══════════════════════════════════════════════════════════════════════ */
+      let finalText = text
+      let gateInfo = null
+      if (bookTitle) {
+        const gate = await callBookGate(
+          { title: bookTitle, subtitle: '', author: '', aliases: [bookTitle] },
+          {
+            pythonPath: cfg.pythonPath || 'python3',
+            // `bookGateClient` 是**测试/本地排障缝**：缺省走 vendor/book-gate/client.py（唯一正路）。
+            // 测试拿它指向假脚本 ⇒ 过真 spawn 链路但零网络；生产永远不填。
+            clientScript: String(cfg.bookGateClient || '').trim()
+              || join(pluginDir, 'vendor', 'book-gate', 'client.py'),
+          },
+        )
+        if (!gate.ok || !gate.found) {
+          const code = !gate.ok && gate.code ? String(gate.code) : 'gate-miss'
+          await dmLedgerWrite((l) => withDmEvent(l, { code: 'dm-gate-miss', detail: code + '（' + bookTitle + '）', uid, day: dayKey(), at: new Date().toISOString() }))
+          return {
+            ok: false, blocked: true, gateMiss: true, bookTitle,
+            error: '「' + bookTitle + '」这次没找到可用资源（' + code + '）。',
+            hint: '明说没找到、给对方一个下一步（书名 / 作者 / 别称任一个，或者让他去站内搜）。'
+              + '**不要编一本替代的，也不要换个说法反复试同一本** —— 书源门是唯一的资源口径。',
+          }
+        }
+        const block = String(gate.block ?? '')
+        const blockLen = Array.from(block).length
+        /* ② 字数按**注入后**的全长算（规格 C 段）：
+         *   finalText = 人话 + '\n' + block ⇒ 人话预算 = 200 − 块长 − 1（那个换行也要算）。
+         *   人话最少 20 字（连一句"给你，看完想聊随时敲我"都放不下就不发）。
+         *   超预算 ⇒ 按预算截人话，**绝不裁块**；截断这件事要在回执里说清（trimmed）。 */
+        const budget = 200 - blockLen - 1
+        if (budget < 20) {
+          await dmLedgerWrite((l) => withDmEvent(l, { code: 'dm-over-limit', detail: '块 ' + blockLen + ' 字，200 装不下', uid, day: dayKey(), at: new Date().toISOString() }))
+          return {
+            ok: false, blocked: true, overLimit: true, blockLen,
+            error: '口令块 ' + blockLen + ' 字，200 字上限里连最少的人话都放不下。',
+            hint: '不裁块、不发半截。这种情况记了账（dm-over-limit）—— '
+              + '要么让本人把上限调高，要么这本书不走私信回链（去评论区/动态发）。',
+          }
+        }
+        const said = Array.from(text).slice(0, budget).join('')
+        finalText = said + '\n' + block
+        gateInfo = {
+          bookId: String(gate.bookId ?? ''),
+          gateSource: String(gate.source ?? ''),
+          blockLen,
+          textLen: Array.from(finalText).length,
+          trimmed: Array.from(text).length > budget,
+        }
+        // ②.5 dry-run 到此为止：书源门与字数核算都跑过了，回执带全文，**不发送、不记账**。
+        //   （判重账本与节奏也不写：dry-run 是验收探针，不能污染真账。）
+        if (dryRun) {
+          return {
+            ok: true, dryRun: true, uid, msg_seqno: seqno,
+            textLen: gateInfo.textLen,
+            bookId: gateInfo.bookId, gateSource: gateInfo.gateSource,
+            blockLen: gateInfo.blockLen, trimmed: gateInfo.trimmed,
+            text: finalText,
+            hint: 'dry-run：书源门与字数核算都跑过了，这是将要发送的全文（**没有发送**）。'
+              + '核对话术/书名/块完整后，把 dry_run 去掉再调一次就会真发。',
+          }
+        }
+        // ②.5 台账（规格 G 段 WP1：门命中即落结构字段，正文不入库）
+        await dmLedgerWrite((l) => withDmRow(l, {
+          uid, msg_seqno: seqno, bookId: gateInfo.bookId, gateSource: gateInfo.gateSource,
+          blockLen, textLen: gateInfo.textLen, ok: true, riskCode: '', skipReason: '',
+          day: dayKey(), at: new Date().toISOString(),
+        }))
+      } else if (dryRun) {
+        return {
+          ok: true, dryRun: true, uid, textLen: Array.from(text).length,
+          hint: '没填 book_title ⇒ 这是纯闲聊回复，不跑书源门。'
+            + '要验回链，填上 book_title 再调一次（dry_run 同样会跑门，只是不发送）。',
+        }
+      }
+
+      const r = await call('bili_send_message', { receiver_uid: uid, text: finalText, msg_seqno: seqno })
       const o = typeof r === 'object' && r ? r : {}
       if (o.success === false || o.error || !(o.success === true || o.ok === true)) {
         // ⭐ 关系门（21047）单独判：平台原话「对方主动回复或关注你前，最多发送1条消息~」。
@@ -2484,7 +2608,15 @@ export function apply(ctx, config) {
           lastDmAt: new Date().toISOString(),
         })
       })
-      return { ok: true, success: true, uid, sentToday: used + 1 }
+      // 📗 T4：dry-run 在书源门之后就返回了（见上面 ②.5），走不到这里。
+      //   能走到这的都是真发送 ⇒ 上面的判重账本 / 节奏都已经按真账记过。
+      return {
+        ok: true, success: true, uid, sentToday: used + 1,
+        ...(gateInfo ? {
+          bookId: gateInfo.bookId, gateSource: gateInfo.gateSource,
+          blockLen: gateInfo.blockLen, textLen: gateInfo.textLen, trimmed: gateInfo.trimmed,
+        } : {}),
+      }
     },
   })
 
@@ -3040,6 +3172,24 @@ export function apply(ctx, config) {
   }
   const whaleLedgerEvent = async (code, detail, extra = {}) => {
     try { await whaleLedgerWrite((l) => withEvent(l, { code, detail, ...extra })) } catch (e) { log('whale ledger 事件写入失败（不致命）：' + String(e?.message ?? e)) }
+  }
+
+  /* 📗 私信线台账（T4，规格 #1751 G 段）—— 落 stateDir/whale-dm/ledger.json。
+   *   与书评线的 whaleLedgerWrite **同形不同文件**：两条线不同账号行为、不同止损，
+   *   混在一份 JSON 里对账自愈会互相污染（规格 G 段「不推服务端、不建表」的落点）。
+   *   同样 fail-open：台账写挂不能把一次已成功的发送变成报错。 */
+  const dmLedgerPath = () => dmLedgerFile(stateDir)
+  const dmLedgerWrite = async (mutate) => {
+    try {
+      return await withStateLock(() => {
+        const ledger = mutate(readJson(dmLedgerPath(), emptyDmLedger()))
+        writeDmLedgerFile(stateDir, ledger)
+        return ledger
+      })
+    } catch (e) {
+      log('dm ledger 读写失败（不致命，对账会补）：' + String(e?.message ?? e))
+      return null
+    }
   }
 
   /* ── 🧭 运行边界（规格 §9.2/§9.4/§9.5；T6）─────────────────────────────────
