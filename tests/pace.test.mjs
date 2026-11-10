@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  BURST, PACE, PACE_KINDS, PACE_PRESETS, QUOTA_SCOPES, RISK_COOLDOWN,
+  BURST, PACE, PACE_KINDS, PACE_PRESETS, QUOTA_CODES, QUOTA_SCOPES, RISK_COOLDOWN,
   nextQuotaReset, paceBook, paceCheck, paceExplain, paceNoteRisk, paceSummary, paceTake,
 } from '../lib/pace.mjs'
 
@@ -164,15 +164,16 @@ test('quota explanation keeps 12014 scoped to video comment/reply and preserves 
     book = paceNoteRisk(book, 12014, NOW).book
     const info = paceExplain(book, NOW, PACE_PRESETS.responsive)
     assert.equal(info.quota.scalesWithFactor, false)
-    assert.deepEqual(info.quota.scopes, { comment: ['comment', 'reply'] })
+    assert.deepEqual(info.quota.scopes, { comment: ['comment', 'reply'], dm: ['dm'] })
     assert.deepEqual(info.quota.parkSec, [2700, 5400, 10800])
     assert.equal(info.quota.maxParkSec, 10800)
     assert.equal(info.quota.strikeDecaySec, 7200)
     assert.equal(info.quota.active.comment.waitSec, expectedMin * 60)
+    assert.equal(info.quota.active.dm, undefined)
     assert.equal(info.risk.active, null)
     for (const kind of PACE_KINDS) {
       const affected = kind === 'comment' || kind === 'reply'
-      assert.equal(info.kinds[kind].quotaBucket, affected ? 'comment' : '')
+      assert.equal(info.kinds[kind].quotaBucket, affected ? 'comment' : kind === 'dm' ? 'dm' : '')
       assert.equal(info.kinds[kind].blockedBy, affected ? 'quota' : '')
       assert.equal(paceCheck(book, kind, NOW).ok, !affected)
     }
@@ -181,6 +182,44 @@ test('quota explanation keeps 12014 scoped to video comment/reply and preserves 
   const parked = paceNoteRisk(null, 12014, nearMidnight).book
   assert.equal(parked.quota.comment, nextQuotaReset(nearMidnight))
   assert.equal(paceExplain(parked, nearMidnight, 0.3).quota.active.comment.waitSec, 6 * 60)
+})
+
+test('dm codes park only dm, and 21046 parks for 24h without spilling into comments (spec #1751 E)', () => {
+  // 21046：平台原话"请在24小时后再发" ⇒ dm 桶停到 00:05 天花板为止（最长 24h），
+  //   评论/回复/动态一条不受影响。⚠️ 天花板是本地 00:05：NOW=12:00 ⇒ 剩 12h25m，不是整 24h。
+  const book = paceNoteRisk(null, '21046', NOW).book
+  assert.equal(book.quota.dm, nextQuotaReset(NOW))
+  assert.equal(book.quota.comment, undefined)
+  assert.equal(book.cooldownUntil, 0)
+  const info = paceExplain(book, NOW, PACE_PRESETS.responsive)
+  assert.equal(info.risk.active, null)
+  assert.equal(info.quota.active.dm.waitSec, (nextQuotaReset(NOW) - NOW) / 1000)
+  assert.equal(info.quota.active.comment, undefined)
+  for (const kind of PACE_KINDS) {
+    const affected = kind === 'dm'
+    assert.equal(paceCheck(book, kind, NOW).ok, !affected)
+    // 未被 dm 桶管住的 kind：reason 为 undefined（paceCheck 只在被拦时才填）
+    assert.equal(paceCheck(book, kind, NOW).reason, affected ? 'quota' : undefined)
+  }
+  // 21020 / 21015 / 25003 同一个 dm 桶；同样停到 00:05 天花板（平台显式禁令，不做 45→90→180 递增）
+  for (const code of ['21020', '21015', '25003']) {
+    const first = paceNoteRisk(null, code, NOW).book
+    assert.equal(first.quota.dm, nextQuotaReset(NOW))
+    assert.equal(first.cooldownUntil, 0)
+    assert.equal(paceCheck(first, 'comment', NOW).ok, true)
+    assert.equal(paceCheck(first, 'dm', NOW).ok, false)
+  }
+})
+
+test('21047 relationship gate is deliberately absent from cooldown and quota tables', () => {
+  // 关系门不是风控也不是额度：宿主在 dm 发送链里单独判（不重试、换下一个人）。
+  // 这里钉住"两张表里都没有它"，防止后来者顺手把它加进去把正常业务结果变成停牌。
+  assert.equal(QUOTA_CODES['21047'], undefined)
+  assert.equal(RISK_COOLDOWN['21047'], undefined)
+  const book = paceNoteRisk(null, '21047', NOW).book
+  assert.equal(book.cooldownUntil, 0)
+  assert.deepEqual(book.quota, {})
+  assert.equal(paceCheck(book, 'dm', NOW).ok, true)
 })
 
 test('risk cooldown descriptions remain global, unscaled, and cannot reduce an existing cooldown', () => {

@@ -2260,6 +2260,15 @@ export function apply(ctx, config) {
   }
   /** 今天回过这个人几条 —— **纯参考信息，不是额度**（2026-10-21 起没有了每人每天上限） */
   const dmSentToday = (uid) => dmSentTodayOf(readJson(dutyStateFile, {}), uid, dayKey())
+  /** 关系门等待名单（`state.json` 的 `dmGateWaiting`）：撞过 21047 且对方还没开口的 uid。
+   *  判据仍然只此一份：这里读出来原样透传给 `dmSkipReason`（lib/dm.mjs ④）。 */
+  const dmGateWaitingMap = () => {
+    const st = readJson(dutyStateFile, {})
+    const m = st.dmGateWaiting
+    return m && typeof m === 'object' && !Array.isArray(m) ? m : {}
+  }
+  /** 给 `dmSkipReason` 的 cfg：运行态配置 + 关系门等待名单（合成一份，不改盘上 config.json） */
+  const dmJudgeCfg = () => ({ ...cfg, dmGateWaiting: dmGateWaitingMap() })
 
   tool({
     name: 'bili_dm_inbox',
@@ -2280,7 +2289,7 @@ export function apply(ctx, config) {
         // 🔁 统一钥匙：先按新格式找，找不到再认老格式的裸 seqno（老账本不能失效）
         const seenDm = dupLookup(replied, keyDmReply(seq, it.uid), legacyDmKeys(seq))
         const was = seenDm.hit ? { at: seenDm.at } : undefined
-        const skip = dmSkipReason(it, cfg, was)
+        const skip = dmSkipReason(it, dmJudgeCfg(), was)
         return {
           ...it,
           already_replied: seenDm.hit,
@@ -2400,7 +2409,7 @@ export function apply(ctx, config) {
           return { ok: false, blocked: true, hint: `msg_seqno=${seqno} 不是 ${uid} 发的（是 ${fresh.uid}）—— uid 和 seqno 对不上，别硬发。` }
         }
         const dmSeen = dupLookup(dmRepliedMap(), keyDmReply(seqno, uid), legacyDmKeys(seqno))
-        const skip = dmSkipReason(fresh, cfg, dmSeen.hit ? { at: dmSeen.at } : undefined)
+        const skip = dmSkipReason(fresh, dmJudgeCfg(), dmSeen.hit ? { at: dmSeen.at } : undefined)
         if (skip && !args.force) return { ok: false, blocked: true, hint: skip }
       }
       /* ⏱️ 出手节奏（2026-10-21 m18802 第 1、2 条 + 风控资料；当晚 17:44 使用者又要求放宽）：
@@ -2413,6 +2422,25 @@ export function apply(ctx, config) {
       const r = await call('bili_send_message', { receiver_uid: uid, text, msg_seqno: seqno })
       const o = typeof r === 'object' && r ? r : {}
       if (o.success === false || o.error || !(o.success === true || o.ok === true)) {
+        // ⭐ 关系门（21047）单独判：平台原话「对方主动回复或关注你前，最多发送1条消息~」。
+        //   这是**正常业务结果**，不是风控也不是额度 ⇒ 不进 pace 的两张表（tests/pace.test.mjs 钉着），
+        //   也**绝不重试**（换措辞重试只会更像骚扰）。只记账 + 让模型换下一个人。
+        const gateCode = String(o.code ?? o.error_code ?? '')
+        if (gateCode === '21047') {
+          await withStateLock(() => {
+            const st = readJson(dutyStateFile, {})
+            const waiting = st.dmGateWaiting && typeof st.dmGateWaiting === 'object' && !Array.isArray(st.dmGateWaiting) ? st.dmGateWaiting : {}
+            waiting[String(uid)] = { at: new Date().toISOString(), seqno: String(seqno) }
+            writeJson(dutyStateFile, { ...st, dmGateWaiting: waiting })
+          })
+          log(`💬 私信关系门（21047）：${uid} 还没回复/关注，今天不再给这个人发第二条（等他开口）`)
+          return {
+            ok: false, blocked: true, relationshipGate: true, uid,
+            error: '对方主动回复或关注前只能发一条（21047）—— 这不是出错，等他回一句再说。',
+            hint: '这个号在「等对方开口」名单里了：他再发新消息（新 msg_seqno）才会解锁。'
+              + '别换措辞重试、别换会话试探 —— 那样最像骚扰。去回别的人，或者翻翻评论区/字幕。',
+          }
+        }
         const risk = paceRiskOf(o)
         return { ok: false, unknown: o.success !== false && !o.error, error: String(o.error || o.message || '发送结果未知'), raw: o, ...(risk ? { riskNote: risk } : {}) }
       }
@@ -4174,9 +4202,20 @@ export function apply(ctx, config) {
     paceWrite(r.book)
     const min = Math.ceil(r.waitMs / 60_000)
     if (r.quota) {
-      const what = r.bucket === 'comment' ? '评论' : r.bucket
+      // ⭐ 2026-11-10：dm 桶要有自己的话（规格 #1751 E 段）—— 停 dm 不停评论，
+      //    而且 21046 的平台原话是"24小时后再发"，退避提示照 dm 口径说。
+      const dm = r.bucket === 'dm'
+      const what = r.bucket === 'comment' ? '评论' : dm ? '私信' : r.bucket
       const parkMin = Math.max(1, Math.round(r.waitMs / 60_000))
-      log(`⏱️ ${what}额度满了（${r.code}）⇒ 只停${what} ${parkMin} 分钟（第 ${r.strikes || 1} 次，再撞会越停越久，最多 3 小时）；私信和动态不受影响`)
+      const hours = Math.round(r.waitMs / 3600_000)
+      const waitText = dm && hours >= 1 ? `${hours} 小时` : `${parkMin} 分钟`
+      log(dm
+        ? `⏱️ 私信被平台限了（${r.code}）⇒ 只停私信 ${waitText}（第 ${r.strikes || 1} 次）；评论/回复/动态不受影响`
+        : `⏱️ ${what}额度满了（${r.code}）⇒ 只停${what} ${parkMin} 分钟（第 ${r.strikes || 1} 次，再撞会越停越久，最多 3 小时）；私信和动态不受影响`)
+      if (dm) {
+        return `私信被平台限住了（${r.code}）⇒ 只歇私信 ${waitText}，到点自动再试。`
+          + '这不是风控，是平台给定的节奏（对方回复前别连发、别换号）—— 评论和动态照常。'
+      }
       return `${what}额度满了（${r.code}，不是被风控）⇒ 先歇 ${parkMin} 分钟，到点自动再探一次；`
         + '要是还满，下次会停更久（45 分 → 90 分 → 180 分封顶）。'
         + '这段时间可以回私信、看评论、翻字幕、写日报 —— 私信和发动态不受影响。'
@@ -4188,7 +4227,9 @@ export function apply(ctx, config) {
   /**
    * 从一次失败的返回里认出"是不是被风控/额度满了"，认出就记一笔。
    * 判据：`code` 字段（MCP 侧成功失败都会带）+ 文本里出现的 -352/-412/-509/-799/+12014。
-   * ⚠️ 12014 走的是**按桶停牌**，不是全局冷却（见 lib/pace.mjs 的 QUOTA_CODES）。
+   * ⭐ 2026-11-10 私信码（规格 #1751 E 段）：21020/21046/21015/25003 也在这条链上认 ——
+   *   它们全在 QUOTA_CODES 的 dm 桶（lib/pace.mjs），撞了只停 dm，绝不连坐评论/动态。
+   * ⚠️ 12014 / 210xx 走的是**按桶停牌**，不是全局冷却（见 lib/pace.mjs 的 QUOTA_CODES）。
    */
   const paceRiskOf = (resp) => {
     const o = typeof resp === 'object' && resp ? resp : {}
@@ -4196,7 +4237,7 @@ export function apply(ctx, config) {
     const codes = []
     if (raw !== '' && raw !== undefined && raw !== null) codes.push(String(raw))
     const text = `${o.error ?? ''} ${o.message ?? ''} ${o.hint ?? ''}`
-    for (const m of text.matchAll(/(?:^|[^\d-])(12014|-352|-412|-509|-799)\b/g)) codes.push(m[1])
+    for (const m of text.matchAll(/(?:^|[^\d-])(12014|21015|21020|21046|25003|-352|-412|-509|-799)\b/g)) codes.push(m[1])
     for (const c of codes) {
       if (QUOTA_CODES[c] || RISK_COOLDOWN[c]) return paceRisk(c)
     }
