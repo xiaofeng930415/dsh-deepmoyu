@@ -94,6 +94,11 @@ import { callBookGate } from './lib/book-gate.mjs'
 // 📗 私信线判据（T3：求资源判定 + 书名抽取）与台账（T4：dm 段）—— 与书评线同形不同文件
 import { dmResourceIntent } from './lib/dm-intent.mjs'
 import { dmLedgerFile, emptyDmLedger, writeDmLedgerFile, withDmRow, withDmEvent } from './lib/dm-ledger.mjs'
+// 📗 私信值守（T8）：判定纯函数 + 退避/停损账本形状；宿主只做「读 → 判 → 看一眼」
+import {
+  DM_WATCH_POLL_MIN, DM_WATCH_POLL_MAX, DM_WATCH_DEFAULT_START, DM_WATCH_DEFAULT_END,
+  dmWatchDue, dmWatchMarkPolled, dmWatchBackoff, dmWatchStop, dmWatchStopClear, dmWatchSummary,
+} from './lib/dm-watch.mjs'
 import { whaleLedgerFile, emptyLedger, parseBlockContact, withGateHit, withBeforeSend, withAfterSend, withEvent, withBackfill, missingGuardSends, localDayOf, writeWhaleLedgerFile, withV1Result, withIngest, dueV1Checks, selectPendingIngest, withStop, withStopCleared, withRecovery, withRecoveryResult, withSpeed, withSpeedCleared, withSendOutcome, withDomResult } from './lib/whale-ledger.mjs'
 import { probeDom, judgeDomResult, pickV2Targets } from './lib/whale-dom.mjs'
 import { readBounds, boundsFileOf, firstReviewOpen, dailyCapState, stopState, stopUntilOf, evaluateStop, evaluateSpeed, evaluateAlerts, recoveryVerdict } from './lib/whale-bounds.mjs'
@@ -583,6 +588,9 @@ export function apply(ctx, config) {
     autoReplyDm: false, dmReplyPerDay: 0, dmReplyFollowedOnly: true,
     // 📗 私信线书源门客户端路径覆盖（T4 测试缝；缺省空 = vendor/book-gate/client.py 唯一正路）
     bookGateClient: '',
+    // 📗 私信值守（T8，规格 #1751 A/E/F 段）：默认关；只有本人能开。
+    //   生效三与 = dmWatch && autoReplyDm && !sendReview（人审速度就是 SLA）。
+    dmWatch: false, dmWatchPollMinutes: 3, dmWatchStart: '07:00', dmWatchEnd: '24:00',
     // 🐟 鲸鱼摸鱼模式（键必须和 Config 里的一模一样，normalize 是按 base 的键挑的）
     persona: '', focus: '', autoMoment: false, momentPerDay: 1, momentStyle: '随心情', interactionStyle: 'companion', modelId: '', tokenBudget: 0, totalTokenBudget: 0, maxRounds: 64, mirrorDir: '', updateRegistry: '', updateMirror: true,
     // ⏱️ 出手节奏系数（1 = 标准；2 = 间隔翻倍；0.5 = 快一倍）—— 2026-10-21 使用者 m18802 第 1、2 条
@@ -2583,6 +2591,19 @@ export function apply(ctx, config) {
           }
         }
         const risk = paceRiskOf(o)
+        /* 📗 T8（规格 #1751 E 段）：21046「请在24小时后再发」⇒ 私信线停损 24h + 报本人。
+         *   pace 那边已经按 dm 桶停了发送（T2）；这里补两件它不管的事：
+         *   ① 值守也不起轮了（state.dmWatch.stopUntil）—— 不然值守还在每分钟看收件箱，
+         *      看到新消息想起轮又被 pace 挡回，白烧一轮模型；
+         *   ② 台账记事件 + act 报本人（规格 E 段「停 dm 24h 并报本人」）。 */
+        const code = String(o.code ?? o.error_code ?? '')
+        if (code === '21046') {
+          const until = Date.now() + 24 * 3600_000
+          await bumpState((fresh) => ({ dmWatch: dmWatchStop(fresh.dmWatch, until, code) }))
+          await dmLedgerWrite((l) => withDmEvent(l, { code: 'dm-risk-blocked', detail: '21046 停 24h', uid, day: dayKey(), at: new Date().toISOString() }))
+          log(`💬 私信被平台限了（21046）⇒ 私信线停 24 小时（到 ${new Date(until).toISOString()}）；评论/动态照常`)
+          try { act('error', '私信被 B站 限了（21046，24 小时后再发）⇒ 私信停了 24 小时，评论和动态不受影响') } catch { /* 流水不拦 */ }
+        }
         return { ok: false, unknown: o.success !== false && !o.error, error: String(o.error || o.message || '发送结果未知'), raw: o, ...(risk ? { riskNote: risk } : {}) }
       }
       await paceDone('dm')
@@ -7639,6 +7660,9 @@ export function apply(ctx, config) {
       backgroundRelay: pendingRelay ? { why: String(pendingRelay.why), attempts: Number(pendingRelay.attempts) || 0, deadlineAt: Number(pendingRelay.deadlineAt) || 0, remainingMs: relayRemainingMs(pendingRelay.deadlineAt, Date.now()) } : null,
       /* ⭐ 后台时段任务：给前端显示「时段内一直刷 / 已挂免跑牌到几点」 */
       bgWindow: { start: String(cfg.backgroundWindowStart || ''), end: String(cfg.backgroundWindowEnd || ''), active: Boolean(String(cfg.backgroundWindowStart || '') && String(cfg.backgroundWindowEnd || '') && backgroundWindowActive(cfg.backgroundWindowStart, cfg.backgroundWindowEnd)), holdUntil: Number(st.bgWindowHold) || 0 },
+      /* 📗 私信值守（T8）：设置页要显示「在跑吗 / 上一跳什么时候 / 停损到什么时候」。
+       *    dmWatchSummary 是纯函数（不参与判定），形状见 lib/dm-watch.mjs。 */
+      dmWatch: dmWatchSummary(cfg, st, Date.now()),
       /* 🗨️🎨 显示层：petEvent 是桌宠「说话」的通道（收工小结/闲聊），mood 是心情色，
        *    attention 是「需要你」提醒 —— 三者都不影响任何行为。 */
       petEvent: st.petEvent && st.petEvent.at ? { at: Number(st.petEvent.at) || 0, text: String(st.petEvent.text || ''), tone: String(st.petEvent.tone || 'info'), kind: String(st.petEvent.kind || 'note') } : null,
@@ -8238,6 +8262,8 @@ export function apply(ctx, config) {
         // 🐾 桌宠显隐（2026-10-26 桌宠化改造）：桌宠菜单「隐藏桌宠」→ 存这里。
         //    ⚠️ 漏在这张表外 = 桌宠藏起来之后设置页的开关存不上 ⇒ 永远唤不回（跟 dmReplyFollowedOnly 同一个坑）
         'petShow',
+        // 📗 私信值守（T8）：四个键必须都能从设置页存进来（漏一个 = 界面改了不生效）
+        'dmWatch', 'dmWatchPollMinutes', 'dmWatchStart', 'dmWatchEnd',
         ...Object.keys(RUN_DEFAULTS),
         ...Object.keys(AUTOMATION_DEFAULTS),
         ...Object.keys(COMPANION_DEFAULTS),
@@ -8728,6 +8754,56 @@ export function apply(ctx, config) {
     startup?.unref?.(); timer?.unref?.()
     return () => { clearTimeout(startup); clearInterval(timer) }
   }, 'bili-duty: V1 补核巡检')
+
+  /* 📗 私信值守（T8，规格 #1751 A/E/F 段）——
+   * 为什么要**独立一个定时器**、不并进上面那两条（谷时 tick / automationTick）：
+   *   ① 它们各自有前置早退（`if (!cfg.peakValley) return` / 会话鱼互斥 / 后台子进程占用），
+   *      并进去会被一起挡掉 —— 而值守是「只读收件箱」的轻活，跟刷不刷、后台在不在无关；
+   *   ② 30 秒一跳：dm 的正常间隔是 3 分钟，用 60 秒的粒度会把「到点」拖成一分钟误差；
+   *      30 秒够细，又不至于每分钟白跑（判定是纯函数 + 一个小 JSON 的读）。
+   * ⭐ unref()：值守不许钉住进程退出（selfcheck 的假 ctx 会挂死）。
+   * ⭐ 关停是一次**真实的状态转移**：dispose 里先置 disposed 标志再清定时器 ——
+   *    在途那一跳看到标志就安静退出（不再读列表、不再起轮），跟停止按钮同一条路径。 */
+  ctx.effect(() => {
+    let disposed = false
+    let inFlight = false
+    const tick = async () => {
+      if (disposed || inFlight) return
+      inFlight = true
+      try {
+        refreshCfg()
+        const st = readJson(dutyStateFile, {})
+        const verdict = dmWatchDue(cfg, st, Date.now())
+        if (!verdict.due) return
+        /* 看一眼收件箱。⚠️ 只读：不看会话正文、不起模型轮 —— 真正「起不起一轮回复」
+         *   由值守接线在回复链上做（判定与闸门都只有一份，见 dm-watch.mjs 不变量①）。
+         *   ⚠️ 撞风控码 ⇒ 只抬**读取退避**档，发送节奏一个数都不动（不变量②）。 */
+        const r = await call('bili_dm_list', { num: 20 })
+        const o = typeof r === 'object' && r ? r : {}
+        if (o.error) {
+          // 读失败（多半 -509/-412 或登录态）⇒ 退避升一档 + 记日志；不当成"没有新私信"
+          await bumpState((fresh) => ({ dmWatch: dmWatchBackoff(fresh.dmWatch, Date.now()).book }))
+          log(`📗 私信值守这一跳没读到（${String(o.error).slice(0, 120)}）⇒ 轮询退避一档`)
+          return
+        }
+        const count = Array.isArray(o.items) ? o.items.length : 0
+        await bumpState((fresh) => ({ dmWatch: dmWatchMarkPolled(fresh.dmWatch, Date.now()) }))
+        log(`📗 私信值守：看了一眼收件箱（${count} 条「对方说最后一句」）`)
+        // 桶读失败照样说：静默少看一类人 = 「陌生人私信总看不到」那种谜题（与 #1759 同口径）
+        if (Array.isArray(o.bucket_errors) && o.bucket_errors.length) {
+          log(`⚠️ 私信值守：${o.bucket_errors.length} 个会话桶读失败，那一类人的私信这轮没看到`)
+        }
+      } catch (e) {
+        log(`📗 私信值守这一跳出错（已兜住）：${String(e?.message ?? e)}`)
+      } finally {
+        inFlight = false
+      }
+    }
+    const startup = setTimeout(tick, 5_000)
+    const timer = setInterval(tick, 30_000)
+    startup?.unref?.(); timer?.unref?.()
+    return () => { disposed = true; clearTimeout(startup); clearInterval(timer) }
+  }, 'bili-duty: 私信值守（dmWatch）')
 
   /* 📁 记录镜像的兜底定时器（挂载时已经同步过一次了）——
    * ⭐ unref()：它是"顺手刷新"，不能反过来钉住进程退出（selfcheck.mjs 的假 ctx 会因此挂死）。
