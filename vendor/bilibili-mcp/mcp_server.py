@@ -16,6 +16,10 @@ B站数据采集 MCP 服务，支持 OpenClaw / Claude Code / Cursor / Cline
 #      ⑤ `bili_reply` 回执带上 `rpid` / `rpid_str` / `root` / `parent`（判重表与评论复核要用）
 #      ⑥ `bili_received_replies` 按真机结构拍平（root_rpid / reply_rpid / said / my_comment）
 #      ⑦ `bili_dm_list` / `bili_dm_thread`：私信收件箱与往来（自动回私信要能先看见）
+#         · 2026-11-10（#1759 防御式加桶）：`bili_dm_list` 按 `DM_SESSION_TYPES = (1, 2, 8)`
+#           三桶读后合并去重（同一 talker 保留最新 last_msg），**不读 5（被拦截）**；
+#           单桶失败带回 `bucket_errors`，不再静默少看一类人。
+#           下游复核（`bili_dm_reply` 的 staleSeqno 判定）跟着覆盖三桶，陌生人不再被误判。
 #      ⑧ `bili_my_notices`：点赞 / @ 通知拍平（原来 `bili_received_at_and_likes` 直接吐原始嵌套，
 #         一层套一层根本读不动，模型只能"看到了但不知道谁赞了什么"）
 #      ⑨ `bili_reply_opus`：动态（opus）下面的评论回复。**动态没有 BV 号**，走
@@ -2102,6 +2106,49 @@ def _ts_to_str(ts) -> str:
         return ""
 
 
+# ⭐ 私信收件箱要读哪些 session_type（2026-11-10，规格 #1751 D 段「防御式加桶」）：
+#   1 = 私聊/用户与系统、2 = 未关注人、8 = 陌生人。
+#   **故意不含 5（被拦截）**：那个桶需要本人在消息中心手动「信任」，是平台留的安全阀，
+#   自动化替她拆掉等于把风控最重的一条通道整个打开。
+#   **刻意不取 4（全部）**：全量会把系统号/通知一起捞回来，下游还得再滤一遍，
+#   而 4 与 1 在真机实测里返回同一批（2026-11-10 T1 六桶读数）⇒ 多读一次纯浪费。
+#   两套公开口径互相矛盾（接口文档：1=用户与系统/2=未关注/8=陌生人；
+#   库 docstring：1=私聊/2=通知/3=应援团/4=全部），哪个桶里躺着陌生人**没有一手实测**，
+#   所以按「防御式」三个都读：读不到就是空桶，成本多两次接口调用，漏一个人才是真的亏。
+DM_SESSION_TYPES = (1, 2, 8)
+
+
+def _dm_collect_sessions(types=DM_SESSION_TYPES):
+    """按桶取会话并合并：返回 (sessions, errors)。errors 是每个桶失败的原因（不抛）。
+
+    同一个 talker 可能出现在多个桶里（口径没定死之前这是常态）⇒ 调用方按 talker_id 去重，
+    保留**最新一条 last_msg** 的那个桶（时间戳更大者）。
+    """
+    async def _run():
+        merged, errors = {}, []
+        for st in types:
+            try:
+                result = await session.get_sessions(credential=cred, session_type=st)
+            except Exception as e:  # 单桶失败不该让整个收件箱瞎掉：别的桶照常返回
+                errors.append({"session_type": st, "error": str(e)})
+                continue
+            rows = result.get("session_list") if isinstance(result, dict) else None
+            if not isinstance(rows, list):
+                continue
+            for s in rows:
+                if not isinstance(s, dict):
+                    continue
+                talker = s.get("talker_id")
+                if talker is None:
+                    continue
+                last = s.get("last_msg") or {}
+                prev = merged.get(talker)
+                if prev is None or int(last.get("timestamp") or 0) > int(prev.get("timestamp") or 0):
+                    merged[talker] = s
+        return list(merged.values()), errors
+    return _run()
+
+
 @tool()
 async def bili_dm_list(num: int = 10) -> str:
     """
@@ -2114,25 +2161,15 @@ async def bili_dm_list(num: int = 10) -> str:
         会话列表（含 msg_seqno —— 回完要靠它判重，别回第二遍）
     """
     cred = get_cred()
-    try:
-        result = await session.get_sessions(credential=cred, session_type=1)
-    except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-
-    sessions = result.get("session_list") if isinstance(result, dict) else None
-    if not isinstance(sessions, list):
-        return json.dumps(stringify_ids(result), ensure_ascii=False)
+    sessions, bucket_errors = await _dm_collect_sessions()
 
     out = []
     for s in sessions:
-        if not isinstance(s, dict):
-            continue
         # 系统号（社区中心 / 登录通知 / 客服）不是「人」⇒ 一律不看：
-        #   · session_type 不是 1 的不是私聊
         #   · 带 account_info / system_msg_type / notify_code 的是官方号
         #   · msg_type 不是 1 的（10=系统通知，2=图片，7=分享）也别当聊天
-        if s.get("session_type") != 1:
-            continue
+        # ⚠️ 2026-11-10 起**不再按 session_type 过滤**：桶本身就是要读的 1/2/8，
+        #    再按 `!= 1` 滤掉就把未关注人/陌生人全滤没了（那正是 #1751 要解决的事）。
         if s.get("system_msg_type") or s.get("account_info"):
             continue
         last = s.get("last_msg") or {}
@@ -2163,13 +2200,19 @@ async def bili_dm_list(num: int = 10) -> str:
     # 新的排前面
     out.sort(key=lambda x: x["time"], reverse=True)
     out = out[:max(1, min(int(num or 10), 50))]
-    return json.dumps({
+    payload = {
         "count": len(out),
         "items": out,
         "hint": ("count=0 表示最近没有「对方说最后一句」的私信（正常结果，不是失败）" if not out else
                  "回一条：bili_send_message(receiver_uid=items[i].uid, text='…')。"
                  "每条都带 msg_seqno —— 那是判重的钥匙，回完记下来，同一个 seqno 别回两遍。"),
-    }, ensure_ascii=False)
+    }
+    # 单桶失败要说出来（2026-11-10）：三桶里挂一个就静默少看一类人，
+    #   表现是「陌生人私信总看不到」，而日志里一句原因都没有 —— 那种谜题查一小时。
+    if bucket_errors:
+        payload["bucket_errors"] = bucket_errors
+        payload["hint"] += " ⚠️ 有会话桶读取失败（见 bucket_errors）—— 那一类人的私信这轮没看到，别当成没有。"
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ========== Tool 21.2: 某个人的私信往来 ==========

@@ -2273,8 +2273,10 @@ export function apply(ctx, config) {
   tool({
     name: 'bili_dm_inbox',
     description: '看 B站 私信收件箱：谁给你发了私信、说了什么。\n'
-      + '⭐ 每条都标了 `can_reply`（这条**能不能回**）和 `skip_reason`（不能回的原因：回过了 / 陌生人 / 晾太久）；'
-      + '`count=0` 表示最近没有要回的私信，是正常结果。**没有每日条数上限** —— 想回几条就回几条。',
+      + '⭐ 每条都标了 `can_reply`（这条**能不能回**）和 `skip_reason`（不能回的原因：回过了 / 陌生人 / 晾太久 / 等对方开口）；'
+      + '`count=0` 表示最近没有要回的私信，是正常结果。**没有每日条数上限** —— 想回几条就回几条。\n'
+      + '⚠️ 读取覆盖私聊 / 未关注人 / 陌生人三种会话桶（**不含被平台拦截的桶**，那要本人手动信任）；'
+      + '某个桶读取失败时回执带 `bucket_errors` —— 那一类人的私信这轮没看到，别当成没有。',
     parameters: {
       num: { type: 'number', description: '最多看几条（默认 10）' },
     },
@@ -2307,8 +2309,16 @@ export function apply(ctx, config) {
         count: items.length,
         items,
         autoReplyDm: Boolean(cfg.autoReplyDm),
+        // ⭐ 2026-11-10（#1759 防御式加桶）：MCP 侧按 1/2/8 三桶合并读，单桶失败带回来。
+        //   原样透出 + 写日志：静默少看一类人 = 「陌生人私信总看不到」那种谜题。
+        ...(Array.isArray(o.bucket_errors) && o.bucket_errors.length
+          ? { bucket_errors: o.bucket_errors.map((e) => ({ session_type: e.session_type, error: String(e.error ?? '') })) }
+          : {}),
         hint: items.length === 0
           ? '最近没有「对方说最后一句」的私信 —— 这是正常结果，不是出错'
+            + (Array.isArray(o.bucket_errors) && o.bucket_errors.length
+              ? '（⚠️ 有会话桶读失败，那一类人的私信这轮没看到，别当成没有）'
+              : '')
           : '`can_reply=true` 的想回就回：bili_dm_reply(uid=…, text=…, msg_seqno=…)。'
             + '`skip_reason` 说了为什么不能回的别硬回；**没有条数上限**，也不必每条都答。',
       }
@@ -2396,13 +2406,20 @@ export function apply(ctx, config) {
       if (seqno !== '0') {
         // ⭐ 翻 100 条（2026-10-26）：原来写死 30，收件箱一活跃目标消息就被挤出前 30，
         //    合法回复被误判 staleSeqno"这条已经不在了"。（MCP 侧自己还有钳制，多要不亏）
+        // ⭐ 2026-11-10（#1759）：这一遍复核现在覆盖三桶合并后的列表 —— 陌生人的 seqno
+        //    以前在 type=1 里查不到，会被误判 staleSeqno 而拒绝回复（#1751 D 段要解决的坑）。
         const rr = await call('bili_dm_list', { num: 100 })
         const ro = typeof rr === 'object' && rr ? rr : {}
         const fresh = (Array.isArray(ro.items) ? ro.items : []).find((x) => readableId(x.msg_seqno) === seqno && readableId(x.uid) === uid)
         if (!fresh) {
+          // 桶读失败 ≠ 消息不存在（2026-11-10）：区分开，别把"没看到"当成"已回过"
+          const bucketFailed = Array.isArray(ro.bucket_errors) && ro.bucket_errors.length
           return {
             ok: false, blocked: true, staleSeqno: true,
-            hint: `收件箱里已经没有 msg_seqno=${seqno} 这条了（对方又发了新的、或者这条已经回过了）—— 重新 bili_dm_inbox 看一眼，用最新的那条回。`,
+            ...(bucketFailed ? { bucketFailed: true, bucket_errors: ro.bucket_errors } : {}),
+            hint: bucketFailed
+              ? `收件箱有会话桶读取失败（${ro.bucket_errors.map((e) => `type=${e.session_type}`).join(', ')}）⇒ 没法确认 msg_seqno=${seqno} 还在不在。等一轮再试，别当成"已经回过了"。`
+              : `收件箱里已经没有 msg_seqno=${seqno} 这条了（对方又发了新的、或者这条已经回过了）—— 重新 bili_dm_inbox 看一眼，用最新的那条回。`,
           }
         }
         if (readableId(fresh.uid) !== uid) {
